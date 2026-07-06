@@ -65,3 +65,14 @@
 
 # How long the terminal window/tab scan (used for the "OPEN IN" column) may run.
 # TUIMUX_WINDOWS_TIMEOUT=5
+
+# How long the live pane preview capture (bottom panel) may run.
+# TUIMUX_PEEK_TIMEOUT=6
+
+# Quiet window after a keypress before auto-refresh resumes (seconds) — keeps
+# navigation snappy by not repainting under your fingers.
+# TUIMUX_QUIET=1.2
+
+# How long a resumed/lost "reconcile" verdict stays shown after a host flaps
+# back online (seconds).
+# TUIMUX_RECONCILE_TTL=30

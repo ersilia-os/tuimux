@@ -24,8 +24,8 @@
 # Everything else (open / rename / detach / close / keep-awake) lives in the
 # dashboard. This script is the engine it calls for discovery, probing, actions.
 #
-# Config (optional): ~/.config/tuimux/config  — see config.example
-#   TUIMUX_HOSTS, TUIMUX_LOGIN, TUIMUX_LOGINS, TUIMUX_DEFAULT_SESSION, TUIMUX_SSH_TIMEOUT, TUIMUX_REFRESH
+# Config (optional): ~/.config/tuimux/config  — see config.example for the full,
+#   authoritative list of TUIMUX_* settings (hosts, logins, timeouts, terminal, …).
 #
 set -uo pipefail
 
@@ -165,6 +165,7 @@ is_local() { [ "$1" = "$(self_host)" ]; }
 # identical everywhere. Derived from one place (here) and exposed to the dashboard
 # as a hosts_data column, so the UI and the tmux status bar can never disagree.
 fleet_order() {
+  [ -n "${_EOS_FLEET_ORDER+x}" ] && { printf '%s' "$_EOS_FLEET_ORDER"; return; }
   ts_status | awk '$1 ~ /^[0-9]/ && NF>=2 {print $2}' | LC_ALL=C sort -u
 }
 # 0-based position of a host in the fleet ordering (or the count, i.e. "past the
@@ -185,9 +186,10 @@ EOF
 # colour wheel → adjacent machines look clearly different, and a given host is the
 # same colour everywhere). The dashboard reuses this exact value (hosts_data color
 # column), so a session's tmux status bar always matches its row.
-host_color() {
-  is_local "$1" && { printf '#34d8b1'; return; }
-  awk -v i="$(fleet_index "$1")" '
+TEAL="#34d8b1"   # the local machine's fixed accent (single source of truth)
+# Bright accent for a given 0-based fleet index (golden-angle hue).
+color_for_index() {
+  awk -v i="$1" '
     function abs(x) { return x < 0 ? -x : x }
     BEGIN {
       H = i * 137.508; H = H - int(H / 360) * 360   # golden-angle hue, wrapped to [0,360)
@@ -204,6 +206,10 @@ host_color() {
       else             { r = C; g = 0; b = X }
       printf "#%02x%02x%02x", int((r+m)*255+0.5), int((g+m)*255+0.5), int((b+m)*255+0.5)
     }'
+}
+host_color() {
+  is_local "$1" && { printf '%s' "$TEAL"; return; }
+  color_for_index "$(fleet_index "$1")"
 }
 
 # tmux options tuimux sets on every session it drives, as a "cmd1; cmd2; " prefix
@@ -266,11 +272,8 @@ docker_name() {
 # The SSH username to use for a host: its explicit TUIMUX_LOGINS mapping if any,
 # else the global TUIMUX_LOGIN ($USER). Tokens are "host=user"; first match wins.
 login_for() {
-  local host="$1" tok
-  for tok in $TUIMUX_LOGINS; do
-    case "$tok" in "$host="?*) printf '%s' "${tok#*=}"; return ;; esac
-  done
-  printf '%s' "$TUIMUX_LOGIN"
+  local m; m="$(mapping_for "$1")"
+  [ -n "$m" ] && printf '%s' "$m" || printf '%s' "$TUIMUX_LOGIN"
 }
 
 # Just the host names that have an explicit login mapping (one per line). Used by
@@ -414,35 +417,64 @@ true'
 #   login   resolved SSH username (login_for) — who we connect as on this host
 # Self leads; Tailscale-offline ones follow; the dashboard re-sorts consumers last.
 hosts_data() {
-  local h hosts name seen me myowner kind owner mapping probe color login
-  # one tailscale snapshot for the whole call (exported so the subshells below
-  # reuse it via ts_status/ts_ip), and resolve "me"/owner once instead of per host.
-  export _EOS_TS_STATUS _EOS_TS_IP
+  local me myowner
+  # One tailscale snapshot + fleet ordering for the whole call, cached in the
+  # environment so discover_hosts/offline_hosts/self_host/host_owner reuse them
+  # instead of re-shelling tailscale. The per-host classification, colouring and
+  # login resolution then happen in a SINGLE awk pass over that snapshot (rather
+  # than ~5 subprocesses per host), keyed off the exported caches via ENVIRON.
+  export _EOS_TS_STATUS _EOS_TS_IP _EOS_FLEET_ORDER _EOS_ONLINE _EOS_OFFLINE
   _EOS_TS_STATUS="$(tailscale status 2>/dev/null)"
   _EOS_TS_IP="$(tailscale ip -4 2>/dev/null | head -1)"
-  hosts="$(discover_hosts)" || return 1
+  _EOS_FLEET_ORDER="$(fleet_order)"
+  _EOS_ONLINE="$(discover_hosts)" || return 1
   me="$(self_host)"
   myowner="$(host_owner "$me")"
-  for h in $hosts; do
-    is_consumer "$h" && kind=consumer || kind=compute
-    owner="$(host_owner "$h")"; [ -n "$owner" ] || owner="$myowner"
-    mapping="$(mapping_for "$h")"
-    color="$(host_color "$h")"
-    login="$(login_for "$h")"
-    # probe our own machines + anything we've mapped a login for; skip the rest
-    if [ "$h" = "$me" ] || [ "$owner" = "$myowner" ] || [ -n "$mapping" ]; then probe=1; else probe=0; fi
-    [ "$h" = "$me" ] && printf '%s\t1\tonline\t\t%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$kind" "$owner" "$mapping" "$probe" "$color" "$login" \
-                     || printf '%s\t0\tonline\t\t%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$kind" "$owner" "$mapping" "$probe" "$color" "$login"
-  done
-  offline_hosts | while IFS="$(printf '\t')" read -r name seen; do
-    [ -n "$name" ] || continue
-    is_consumer "$name" && kind=consumer || kind=compute
-    owner="$(host_owner "$name")"; [ -n "$owner" ] || owner="$myowner"
-    mapping="$(mapping_for "$name")"
-    color="$(host_color "$name")"
-    login="$(login_for "$name")"
-    printf '%s\t0\toffline\t%s\t%s\t%s\t%s\t0\t%s\t%s\n' "$name" "$seen" "$kind" "$owner" "$mapping" "$color" "$login"
-  done
+  _EOS_OFFLINE="$(offline_hosts)"
+  awk -v self="$me" -v myowner="$myowner" -v deflogin="$TUIMUX_LOGIN" \
+      -v logins="$TUIMUX_LOGINS" -v teal="$TEAL" '
+    function abso(x) { return x < 0 ? -x : x }
+    # Golden-angle accent for a fleet index — identical math to color_for_index.
+    function hsl(i,   H,S,L,C,Hp,X,m,r,g,b) {
+      H = i * 137.508; H = H - int(H / 360) * 360; S = 0.62; L = 0.66
+      C = (1 - abso(2*L - 1)) * S; Hp = H / 60.0
+      X = C * (1 - abso((Hp - 2*int(Hp/2)) - 1)); m = L - C/2
+      if      (Hp < 1) { r=C; g=X; b=0 } else if (Hp < 2) { r=X; g=C; b=0 }
+      else if (Hp < 3) { r=0; g=C; b=X } else if (Hp < 4) { r=0; g=X; b=C }
+      else if (Hp < 5) { r=X; g=0; b=C } else             { r=C; g=0; b=X }
+      return sprintf("#%02x%02x%02x", int((r+m)*255+0.5), int((g+m)*255+0.5), int((b+m)*255+0.5))
+    }
+    function emit(h, islocal, status, seen,   kind, owner, mapping, probe, color, login) {
+      kind = (OS[h]=="ios" || OS[h]=="android" || OS[h]=="androidtv" || OS[h]=="tvos") ? "consumer" : "compute"
+      owner = (h in OWN && OWN[h] != "") ? OWN[h] : myowner
+      mapping = (h in LG) ? LG[h] : ""
+      login = (h in LG) ? LG[h] : deflogin
+      color = islocal ? teal : hsl(IDX[h])
+      probe = (status == "offline") ? 0 : ((h==self || owner==myowner || mapping != "") ? 1 : 0)
+      printf "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", \
+        h, islocal, status, seen, kind, owner, mapping, probe, color, login
+    }
+    BEGIN {
+      n = split(ENVIRON["_EOS_FLEET_ORDER"], F, "\n")
+      for (i=1; i<=n; i++) if (F[i] != "") IDX[F[i]] = i - 1
+      m = split(ENVIRON["_EOS_TS_STATUS"], S, "\n")
+      for (i=1; i<=m; i++) {
+        c = split(S[i], f, /[ \t]+/)
+        if (c >= 4) { o = f[3]; sub(/@$/, "", o); OWN[f[2]] = o; OS[f[2]] = tolower(f[4]) }
+      }
+      p = split(logins, Lk, /[ \t]+/)
+      for (i=1; i<=p; i++) { e = index(Lk[i], "="); if (e > 1 && length(Lk[i]) > e) LG[substr(Lk[i],1,e-1)] = substr(Lk[i],e+1) }
+      no = split(ENVIRON["_EOS_ONLINE"], ON, "\n")
+      for (i=1; i<=no; i++) { h = ON[i]; if (h == "") continue; emit(h, (h==self)?1:0, "online", "") }
+      nf = split(ENVIRON["_EOS_OFFLINE"], OFL, "\n")
+      for (i=1; i<=nf; i++) {
+        if (OFL[i] == "") continue
+        t = index(OFL[i], "\t")
+        if (t > 0) { nm = substr(OFL[i],1,t-1); sn = substr(OFL[i],t+1) } else { nm = OFL[i]; sn = "" }
+        emit(nm, 0, "offline", sn)
+      }
+    }
+  ' </dev/null
 }
 
 # Raw probe output for one host (S|/W|/L|/A|/C| lines); first line OK or UNREACHABLE.
@@ -1385,6 +1417,7 @@ case "${1:-}" in
   __autoname    ) docker_name ;;
   __autostart   ) autostart_state ;;
   __mouse       ) mouse_state ;;
+  __settings    ) printf 'autostart=%s\nmouse=%s\n' "$(autostart_state)" "$(mouse_state)" ;;
   __firstrun    ) first_run_setup ;;
   __console     ) open_console ;;
   __awaketoggle ) shift; toggle_awake "${1:-}" >/dev/null 2>&1 ;;

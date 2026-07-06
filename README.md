@@ -3,6 +3,13 @@
 See and jump into every tmux session on every machine on your
 [Tailscale](https://tailscale.com) tailnet, from one dashboard — over Tailscale SSH.
 
+## Requirements
+
+- **`tmux`** — required; tuimux is a front-end for it and refuses to start
+  without it (`brew install tmux`, `sudo apt install tmux`, `sudo dnf install tmux`).
+- `ssh`, `tailscale`, and a terminal.
+- Python ≥ 3.9.
+
 ## Install
 
 ```sh

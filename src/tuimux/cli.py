@@ -11,6 +11,21 @@ def engine_path() -> str:
     return str(files("tuimux").joinpath("engine.sh"))
 
 
+def _require_tmux() -> None:
+    """tuimux is a front-end for tmux — without it nothing here works. Fail
+    loudly with an actionable message rather than letting a downstream command
+    error out cryptically."""
+    if shutil.which("tmux"):
+        return
+    sys.exit(
+        "tuimux: 'tmux' is not installed or not on PATH.\n"
+        "Install it first, e.g.:\n"
+        "  macOS:         brew install tmux\n"
+        "  Debian/Ubuntu: sudo apt install tmux\n"
+        "  Fedora:        sudo dnf install tmux"
+    )
+
+
 def _maybe_first_run() -> None:
     """On the very first run, let the engine enable the default features
     (autostart + mouse scroll). A marker file makes it a one-time thing; we check
@@ -69,6 +84,7 @@ def relaunch_argv() -> list[str]:
 
 def main() -> None:
     args = sys.argv[1:]
+    _require_tmux()  # nothing tuimux does makes sense without tmux
     _maybe_first_run()  # enable autostart + mouse scroll on the very first run
     if not args:
         from .app import run

@@ -55,9 +55,6 @@ SHELLS = {
     "",
 }
 
-LOCAL = "#34d8b1"  # teal   (this machine)
-REMOTE = "#7aa2f7"  # blue   (other machines)
-CYAN = "#56cfe1"  # folders
 VIOLET = "#b08cff"  # agent
 AMBER = "#e0af68"  # awake / waiting / no-ssh
 GREEN = "#9ece6a"  # active session / running / working
@@ -80,31 +77,6 @@ def _marker(state):
 # own accent stays the dominant colour in its block and amber actually stands out.
 # (No green here: it would collide with the green-ish device accents.)
 _STATE_STYLE = {"waiting": AMBER, "working": "", "running": "", "idle": "dim"}
-
-# Per-machine accent. The engine (host_color) is the source of truth — it derives
-# a distinct colour per host from the canonical fleet ordering and hands it to the
-# dashboard via the hosts_data `color` column, so the tmux status bar always
-# matches. This local hash is only a fallback for older engine output that doesn't
-# emit the column (and to keep the older view-model tests working).
-HOST_PALETTE = (
-    "#7aa2f7",
-    "#b08cff",
-    "#9ece6a",
-    "#56cfe1",
-    "#f7768e",
-    "#ff9e64",
-    "#c678dd",
-)
-
-
-def _host_color(host, is_local):
-    if is_local:
-        return LOCAL
-    h = 5381  # djb2 — spreads similar names across the palette better than a sum
-    for b in host.encode():
-        h = (h * 33 + b) & 0xFFFFFFFF
-    return HOST_PALETTE[h % len(HOST_PALETTE)]
-
 
 # A probe that can't finish in this many seconds is treated as unreachable, so
 # one slow/contended host can't stall (or back up) the whole refresh.
@@ -561,6 +533,7 @@ class Tuimux(App):
         self._last_sig = None
         self._last_keys = []
         self._last_cells = []
+        self._render_pending = False  # a coalesced render is already scheduled
         # terminal layout: [(win_index, tab_title)] and the window holding us
         self._windows = []
         self._self_win = None
@@ -655,9 +628,17 @@ class Tuimux(App):
 
     @work(thread=True)
     def _load_status_note(self):
-        auto = _run(["__autostart"], timeout=HOSTS_TIMEOUT).stdout.strip()
-        mouse = _run(["__mouse"], timeout=HOSTS_TIMEOUT).stdout.strip()
-        self.call_from_thread(self._set_status_note, auto, mouse)
+        # One engine spawn for both toggle states (key=value lines) instead of a
+        # separate `bash engine.sh` invocation per setting at startup.
+        out = _run(["__settings"], timeout=HOSTS_TIMEOUT).stdout
+        st = {}
+        for ln in out.splitlines():
+            k, sep, v = ln.partition("=")
+            if sep:
+                st[k.strip()] = v.strip()
+        self.call_from_thread(
+            self._set_status_note, st.get("autostart", ""), st.get("mouse", "")
+        )
 
     def _set_status_note(self, auto, mouse):
         # Note in the panel's bottom border whether new terminals auto-attach and
@@ -759,7 +740,7 @@ class Tuimux(App):
             self._snap[name] = info["sessions"]
         self._results[name] = info
         self._probing.discard(name)
-        self._render()
+        self._request_render()
 
     @work(exclusive=True, thread=True, group="windows")
     def _scan_windows(self):
@@ -782,7 +763,7 @@ class Tuimux(App):
     def _set_windows(self, wins, self_win):
         self._windows = wins
         self._self_win = self_win
-        self._render()
+        self._request_render()
 
     # ---- live preview ----
     # A panel under the table mirrors the highlighted session's pane — a glimpse
@@ -1047,10 +1028,9 @@ class Tuimux(App):
                 )
             else:
                 # reachable — machine header, tinted with the machine's accent
-                # (local = teal; each remote its own colour). STATUS word matches.
-                # Use the engine's colour (so the tmux bar matches); fall back to
-                # the local hash only if it's somehow absent (older engine output).
-                color = accent or _host_color(host, is_local)
+                # (local = teal; each remote its own colour), which the engine
+                # (host_color) computes and emits so the tmux bar always matches.
+                color = accent
                 word = ("local" if is_local else "ssh", color)
                 rows.append(
                     _row(
@@ -1126,6 +1106,19 @@ class Tuimux(App):
         for text, style in segments:
             txt.append(text, style=style or None)
         return txt
+
+    def _request_render(self):
+        # Coalesce bursts of updates (each probe result, each window scan) into a
+        # single _view() rebuild. Without this, N probes landing in a cycle trigger
+        # N full row-model recomputes on the UI thread; here they collapse into one.
+        if self._render_pending:
+            return
+        self._render_pending = True
+        self.set_timer(0.05, self._render_now)
+
+    def _render_now(self):
+        self._render_pending = False
+        self._render()
 
     def _render(self):
         # Skip painting the (hidden) table while a dialog is up — keeps menus
