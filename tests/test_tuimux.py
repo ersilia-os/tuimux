@@ -20,6 +20,19 @@ from tuimux import app  # noqa: E402
 from tuimux import cli  # noqa: E402
 from tuimux.cli import relaunch_argv, tuimux_bin  # noqa: E402
 
+# Hermetic env: tuimux exports several TUIMUX_* vars into the shells it spawns (e.g.
+# TUIMUX_SELF_HOST when you run inside a tuimux session). If the test runner inherits
+# them, they override the stubbed tailscale/identity these tests set up and cause
+# spurious failures. Strip them once so the suite is independent of where it runs.
+for _leak in (
+    "TUIMUX_SELF_HOST",
+    "TUIMUX_SCOPE",
+    "TUIMUX_HOSTS",
+    "TUIMUX_LOGINS",
+    "TUIMUX_SELF_WINID",
+):
+    os.environ.pop(_leak, None)
+
 
 @contextlib.contextmanager
 def stub_engine(stdout):
@@ -207,6 +220,30 @@ def test_mouse_state_command_reports_on_off():
         assert state() == "off"
         _mouse("on", conf, d)
         assert state() == "on"
+
+
+def test_settings_command_batches_autostart_and_mouse():
+    # The dashboard reads autostart + mouse in one engine spawn (__settings) at
+    # startup instead of one per setting; it must emit parseable key=value lines.
+    with tempfile.TemporaryDirectory() as d:
+        conf = os.path.join(d, "tmux.conf")
+        rc = os.path.join(d, "zshrc")
+        env = {
+            **os.environ,
+            "TUIMUX_TMUX_CONF": conf,
+            "TUIMUX_RC": rc,
+            "TUIMUX_STATE_DIR": os.path.join(d, "state"),
+            "TMUX_TMPDIR": d,
+            "SHELL": "/bin/zsh",
+        }
+        out = subprocess.run(
+            ["bash", app.ENGINE, "__settings"], capture_output=True, text=True, env=env
+        ).stdout
+        st = dict(
+            ln.split("=", 1) for ln in out.splitlines() if "=" in ln
+        )
+        assert set(st) == {"autostart", "mouse"}  # no tabcolor anymore
+        assert st["autostart"] in ("on", "off") and st["mouse"] in ("on", "off")
 
 
 # ---- first run: enable autostart + mouse by default, once -------------------

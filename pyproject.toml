@@ -11,7 +11,7 @@ requires-python = ">=3.9"
 license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "Ersilia Open Source Initiative" }]
 keywords = ["tmux", "tailscale", "ssh", "terminal", "tui", "textual"]
-dependencies = ["textual>=1.0"]
+dependencies = ["textual>=1.0", "rich>=13"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff"]
