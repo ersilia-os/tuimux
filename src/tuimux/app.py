@@ -1548,17 +1548,44 @@ def run():
     client with our command. If the session we were in is a throwaway (a lone
     autostart shell), the relaunch also kills it — running from the freed
     terminal, so it's safe — instead of leaving it cluttering the dashboard.
-    Falls back to a plain message if the handoff can't be performed."""
+
+    `detach-client -E` runs its command in a FRESH shell that doesn't inherit the
+    environment you had inside tmux — so we carry this process's own environment
+    (which is exactly that tmux-session environment) across the handoff via `env`.
+    Without it the dashboard would start but its PATH would be missing the tmux
+    shell's tools (tailscale/tmux/ssh, often in a conda/venv), so nothing would be
+    reachable. Falls back to a plain message if the handoff can't be performed."""
     if os.environ.get("TMUX"):
         sess = _disposable_tmux_session()
         cleanup = (
             f"tmux kill-session -t {shlex.quote(sess)} 2>/dev/null; " if sess else ""
         )
+        # Carry the current environment into the freed terminal so tuimux and the
+        # tools it shells out to are found. The tmux markers must be actively UNSET
+        # (`env -u`), not merely omitted: `env` inherits the ambient environment, and
+        # the freed terminal still has $TMUX set — leave it and the relaunched
+        # dashboard thinks it's *still* inside tmux, loops on the (now clientless)
+        # detach, and exits to a bare shell. Skip non-identifier keys too — bash
+        # exports its functions as names like `BASH_FUNC_x%%`, which `env NAME=…`
+        # rejects.
+        _TMUX_ENV = {"TMUX", "TMUX_PANE", "TMUX_TMPDIR"}
+        unset = " ".join(f"-u {k}" for k in _TMUX_ENV)
+        envp = " ".join(
+            f"{k}={shlex.quote(v)}"
+            for k, v in os.environ.items()
+            if k.isidentifier() and k not in _TMUX_ENV
+        )
         # Quote each argv token separately: relaunch_argv() may be a multi-word
         # `python -m tuimux`, which a single shlex.quote() would mangle into one
         # bogus "python -m tuimux" command name.
         cmd = " ".join(shlex.quote(a) for a in relaunch_argv())
-        relaunch = f"{cleanup}TUIMUX_NO_AUTOTMUX=1 exec {cmd}"
+        relaunch = f"{cleanup}exec env {unset} {envp} TUIMUX_NO_AUTOTMUX=1 {cmd}"
+        # A quick heads-up that we're leaving tmux, before the client detaches.
+        print(
+            "tuimux: leaving this tmux session to open the dashboard "
+            "(it keeps running — `tmux attach` to return)…",
+            file=sys.stderr,
+        )
         try:
             ok = (
                 subprocess.run(

@@ -999,7 +999,7 @@ def test_run_inside_tmux_handoff_is_runnable_for_python_m_launch(monkeypatch):
         app.run()
     assert launched == []
     handoff = _detach_cmd(calls)[3]
-    assert "exec /opt/py/python3 -m tuimux" in handoff
+    assert "/opt/py/python3 -m tuimux" in handoff  # runnable, tokens quoted separately
     assert "'/opt/py/python3 -m tuimux'" not in handoff  # not collapsed to one token
 
 
@@ -1981,6 +1981,23 @@ def test_kick_rechecks_failed_hosts_sparingly():
     a._last_probe[key] = app.time.monotonic()
     a._kick([host])
     assert key in probed
+
+
+def test_run_inside_tmux_carries_the_environment(monkeypatch):
+    # The freed shell won't have the tmux session's PATH unless we carry it across
+    # the handoff — otherwise the dashboard comes up but can't find tailscale/tmux.
+    # The tmux markers must be dropped so the relaunch isn't seen as still nested.
+    monkeypatch.setenv("PATH", "/opt/conda/envs/x/bin:/usr/bin")
+    with _patched_run(returncode=0, tmux="ZZZ_TMUX_MARKER") as (calls, launched):
+        app.run()
+    assert launched == []
+    handoff = _detach_cmd(calls)[3]
+    assert "exec env " in handoff
+    assert "/opt/conda/envs/x/bin" in handoff  # PATH carried across the handoff
+    assert "ZZZ_TMUX_MARKER" not in handoff  # TMUX value not carried
+    # …and TMUX is actively UNSET, so the relaunched dashboard isn't seen as still
+    # inside tmux (which would loop the handoff and drop to a bare shell).
+    assert "-u TMUX" in handoff
 
 
 if __name__ == "__main__":
