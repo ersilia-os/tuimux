@@ -10,8 +10,12 @@
 
 # Per-host SSH usernames, for shared machines where your account isn't $USER.
 # Space-separated host=user tokens; unmapped hosts fall back to TUIMUX_LOGIN.
-# Manage it from the dashboard (press u) or with `tuimux login <host> <user>`.
-# TUIMUX_LOGINS="herbert=mduran nebula=mduran"
+# A host may map to a COMMA-LIST of users to see several accounts' tmux sessions
+# on one box (each user has its own tmux server); the first is the connect-as
+# default and the host fans out to one dashboard row per user.
+# Manage it from the dashboard (press u — comma-separated) or with
+# `tuimux login <host> <user[,user...]>` (--add / --rm to adjust one user).
+# TUIMUX_LOGINS="herbert=mduran splunk-server=mduranfrigola,gturon"
 
 # Session name used when you create one without naming it.
 # TUIMUX_DEFAULT_SESSION="main"

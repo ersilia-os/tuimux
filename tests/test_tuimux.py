@@ -81,7 +81,7 @@ def test_probe_counts_clients_per_session():
         ]
     )
     with stub_engine(canned):
-        info = app.probe("host")
+        info = app.probe("host", "u")
     main = info["sessions"][0]
     assert main["attached"] is True and main["nclients"] == 2
 
@@ -239,9 +239,7 @@ def test_settings_command_batches_autostart_and_mouse():
         out = subprocess.run(
             ["bash", app.ENGINE, "__settings"], capture_output=True, text=True, env=env
         ).stdout
-        st = dict(
-            ln.split("=", 1) for ln in out.splitlines() if "=" in ln
-        )
+        st = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
         assert set(st) == {"autostart", "mouse"}  # no tabcolor anymore
         assert st["autostart"] in ("on", "off") and st["mouse"] in ("on", "off")
 
@@ -458,7 +456,7 @@ CANNED = "\n".join(
 
 def test_probe_parses_sessions_awake_and_agent():
     with stub_engine(CANNED):
-        info = app.probe("host")
+        info = app.probe("host", "u")
     assert info["reachable"] is True
     assert info["busy"] is False
     assert info["awake"] is True  # the keep-awake helper session is present
@@ -473,19 +471,19 @@ def test_probe_parses_sessions_awake_and_agent():
 
 def test_probe_timeout_marks_busy_not_failed():
     with stub_engine("__TIMEOUT__\n"):
-        info = app.probe("host")
+        info = app.probe("host", "u")
     assert info["busy"] is True and info["reachable"] is False
 
 
 def test_probe_unreachable():
     with stub_engine("UNREACHABLE\n"):
-        info = app.probe("host")
+        info = app.probe("host", "u")
     assert info["reachable"] is False and info["busy"] is False
 
 
 def test_probe_keeps_raw_created_for_reconnect_identity():
     with stub_engine(CANNED):
-        info = app.probe("host")
+        info = app.probe("host", "u")
     # the raw session_created epoch is preserved (not just the formatted uptime),
     # so a reconnect can tell whether the very same session survived.
     assert all("created" in s for s in info["sessions"])
@@ -512,14 +510,22 @@ def test_reconcile_resumed_lost_and_quiet():
 
 
 # ---- view-model / rendering --------------------------------------------------
+def _rekey(hosts, d):
+    # Tests key results/snap/reconcile by host name; _view now looks them up by
+    # (host, login). Translate using each host's login column (h[9]; "" for the
+    # short tuples that predate per-host logins).
+    if not d:
+        return {}
+    login_of = {h[0]: (h[9] if len(h) > 9 else "") for h in hosts}
+    return {(k, login_of.get(k, "")): v for k, v in d.items()}
+
+
 def _view_for(hosts, results, snap=None, reconcile=None):
     a = app.Tuimux()
     a._hosts = hosts
-    a._results = results
-    if snap:
-        a._snap = snap
-    if reconcile:
-        a._reconcile = reconcile
+    a._results = _rekey(hosts, results)
+    a._snap = _rekey(hosts, snap)
+    a._reconcile = _rekey(hosts, reconcile)
     return a._view()
 
 
@@ -546,7 +552,7 @@ def test_view_status_words_per_state():
         for cells, _ in rows
     }
     assert status["me"] == "local"
-    assert status["rem"] == "ssh"
+    assert status["rem"] == "online"
     assert status["busyh"] == "busy"
     assert status["noss"] == "no ssh"
     assert status["off"] == "offline"
@@ -554,17 +560,18 @@ def test_view_status_words_per_state():
 
 
 def test_consumer_devices_show_status_only():
-    # Phones/tablets are status-only: online/offline, never "no ssh", no probe.
+    # Phones/tablets are status-only: a "device" when up (never SSH'd, calm gray),
+    # "offline" when down — never "no ssh" or "checking…".
     hosts = [
         ("phone-on", False, "online", "", "consumer"),
         ("phone-off", False, "offline", "1m ago", "consumer"),
     ]
-    rows = _view_for(hosts, {})  # no probe results — must not show "checking…"
+    rows = _view_org(hosts, {})  # no probe results — must not show "checking…"
     status = {
         _cell_text(cells[0]).strip().lstrip("●○◐ "): _cell_text(cells[1])
         for cells, _ in rows
     }
-    assert status["phone-on"] == "online"
+    assert status["phone-on"] == "device"
     assert status["phone-off"] == "offline"
     # consumer rows are non-actionable
     assert all(m["action"] == "none" for _, m in rows)
@@ -1028,17 +1035,18 @@ def _engine_dry(args, env=None):
 
 def test_linux_gnome_tab():
     out = _engine_dry(
-        ["__open", "tab", "macmini", "main", "attach"], {"TUIMUX_TERM": "gnome"}
+        ["__open", "tab", "macmini", "mduran", "main", "attach"],
+        {"TUIMUX_TERM": "gnome"},
     )
     assert (
         out.strip()
-        == f"[dry-run] gnome-terminal --tab -- bash {app.ENGINE} __attach macmini main attach"
+        == f"[dry-run] gnome-terminal --tab -- bash {app.ENGINE} __attach macmini mduran main attach"
     )
 
 
 def test_linux_gnome_window_carries_identity_and_quotes_spaces():
     out = _engine_dry(
-        ["__open", "window", "macmini", "weird name", "attach"],
+        ["__open", "window", "macmini", "mduran", "weird name", "attach"],
         {"TUIMUX_TERM": "gnome", "TUIMUX_SELF_HOST": "mybox"},
     )
     assert "gnome-terminal --window -- env TUIMUX_SELF_HOST=mybox bash" in out
@@ -1047,34 +1055,34 @@ def test_linux_gnome_window_carries_identity_and_quotes_spaces():
 
 def test_linux_custom_template_wraps_via_sh():
     out = _engine_dry(
-        ["__open", "tab", "macmini", "main", "attach"],
+        ["__open", "tab", "macmini", "mduran", "main", "attach"],
         {"TUIMUX_TERM_CMD": "kitty -e sh -c {cmd}"},
     )
     assert out.startswith("[dry-run] sh -c ")
     # {cmd} expanded to the engine invocation, wrapped for the user's terminal
-    for piece in ("kitty", "__attach", "macmini", "main"):
+    for piece in ("kitty", "__attach", "macmini", "mduran", "main"):
         assert piece in out
 
 
 def test_linux_generic_terminal_window_only():
     out = _engine_dry(
-        ["__open", "window", "macmini", "main", "new"],
+        ["__open", "window", "macmini", "mduran", "main", "new"],
         {"TUIMUX_TERM": "generic", "TERMINAL": "alacritty"},
     )
     assert (
         out.strip()
-        == f"[dry-run] alacritty -e bash {app.ENGINE} __attach macmini main new"
+        == f"[dry-run] alacritty -e bash {app.ENGINE} __attach macmini mduran main new"
     )
 
 
 def test_linux_wayland_auto_falls_through_to_new_surface():
     # Wayland blocks jump-to-window, so `auto` can't focus → opens a fresh tab.
     out = _engine_dry(
-        ["__open", "auto", "macmini", "happy-curie", "attach"],
+        ["__open", "auto", "macmini", "mduran", "happy-curie", "attach"],
         {"TUIMUX_TERM": "gnome", "XDG_SESSION_TYPE": "wayland"},
     )
     assert "[dry-run] gnome-terminal --tab -- bash" in out
-    assert "__attach macmini happy-curie attach" in out
+    assert "__attach macmini mduran happy-curie attach" in out
 
 
 # ---- new-tab targeting (engine.sh) ------------------------------------------
@@ -1274,14 +1282,14 @@ def test_login_cli_set_list_rm_and_validation():
         assert Path(cfg).read_text() == before
 
 
-def test_discover_scope_mine_vs_org():
-    # mine: self + same-owner online peers (phone). org: all online peers, any
-    # owner (+ herbert). curie is offline → never in discover (online-only).
+def test_discover_returns_all_online_regardless_of_scope():
+    # Discovery is now owner-agnostic: self + every ONLINE peer, any owner (the app
+    # decides what to SHOW per scope). curie is offline → never discovered.
     mine = _engine_eval("discover_hosts", scope="mine").split()
     org = _engine_eval("discover_hosts", scope="org").split()
-    assert mine == ["mybox", "phone"]
+    assert set(mine) == {"mybox", "herbert", "phone"}
     assert set(org) == {"mybox", "herbert", "phone"}
-    assert "curie" not in org
+    assert "curie" not in mine and "mybox" == mine[0]  # self leads
 
 
 def test_discover_includes_mapped_foreign_host():
@@ -1299,14 +1307,17 @@ def test_hosts_data_columns_owner_mapping_probe():
     by = {r[0]: r for r in rows}
     # name islocal status lastseen kind owner mapping probe
     assert by["mybox"][1] == "1" and by["mybox"][5] == "me" and by["mybox"][7] == "1"
-    assert by["phone"][4] == "consumer"
-    # foreign, unmapped → listed but not probed
+    assert by["phone"][4] == "consumer" and by["phone"][7] == "0"  # never SSH'd
+    # foreign, unmapped, but online + compute → now probeable (access is discovered
+    # by trying); owner recorded, mapping still empty
     assert (
         by["herbert"][5] == "arnau"
         and by["herbert"][6] == ""
-        and by["herbert"][7] == "0"
+        and by["herbert"][7] == "1"
     )
-    assert by["curie"][2] == "offline" and by["curie"][7] == "0"
+    assert (
+        by["curie"][2] == "offline" and by["curie"][7] == "0"
+    )  # offline → never probed
     # mapping a foreign host flips it to probe=1 and records the login
     rows2 = [
         ln.split("\t")
@@ -1322,7 +1333,7 @@ def _view_org(hosts, results):
     a = app.Tuimux()
     a._scope = "org"
     a._hosts = hosts
-    a._results = results
+    a._results = _rekey(hosts, results)
     return a._view()
 
 
@@ -1372,37 +1383,55 @@ def test_view_user_column_shows_owner_and_login():
         "pujarnol": {**base, "reachable": True, "sessions": []},
     }
     rows = _view_org(hosts, results)
+    owner_col = app._COLS.index("owner")
     user_col = app._COLS.index("user")
 
+    def cells_of(label):
+        return next(c for c, _ in rows if label in _cell_text(c[0]))
+
+    def owner_of(label):
+        return _cell_text(cells_of(label)[owner_col])
+
     def user_of(label):
-        cells = next(c for c, _ in rows if label in _cell_text(c[0]))
-        return _cell_text(cells[user_col])
+        return _cell_text(cells_of(label)[user_col])
 
-    # local: owner + the login we use (differ) — shown even though it's "you"
-    assert "miquel" in user_of("mybox") and "mduranfrigola" in user_of("mybox")
-    # unmapped foreign (no account): owner only, no login spelled out
-    assert user_of("herbert").strip() == "arnau"
-    # mapped foreign: owner + the login we connect as
-    assert "gemma" in user_of("pujarnol") and "mduran" in user_of("pujarnol")
-    # herbert is still the un-probed "no login" hint row
-    herbert = next(c for c, _ in rows if "herbert" in _cell_text(c[0]))
-    assert "no login" in _cell_text(herbert[1])
+    # OWNER column = tailnet account (shown as "handle@"); SSH USER = login we use.
+    # local: owner in one column, our login in the other
+    assert owner_of("mybox") == "miquel@" and user_of("mybox") == "mduranfrigola"
+    # unmapped foreign (no account): owner shown, SSH USER blank
+    assert owner_of("herbert") == "arnau@" and user_of("herbert") == ""
+    # mapped foreign: owner + the login we connect as, each in its own column
+    assert owner_of("pujarnol") == "gemma@" and user_of("pujarnol") == "mduran"
+    # herbert has no probe result here → shown as "checking…", SSH USER blank
+    herbert = cells_of("herbert")
+    assert "checking…" in _cell_text(herbert[1])
 
 
-def test_user_cell_never_empty_and_dedupes():
-    uc = app.Tuimux._user_cell
-    # unmapped foreign (no real login) → owner only
-    assert uc("arnau", "mduranfrigola", False, False) == (("arnau", "dim"),)
-    # own/mapped + login differs → both, even when it's your own box
-    assert uc("miquel", "mduranfrigola", True, False) == (
-        ("miquel · mduranfrigola", "dim"),
-    )
-    # owner == login → shown once (it's ok for them to be equal)
-    assert uc("arnau", "arnau", True, False) == (("arnau", "dim"),)
-    # consumer device → owner only (no ssh login)
-    assert uc("miquel", "mduranfrigola", True, True) == (("miquel", "dim"),)
-    # nothing known → never blank
-    assert uc("", "", True, False) == (("—", "dim"),)
+def test_owner_and_login_cells_split():
+    owner_cell = app.Tuimux._owner_cell
+    login_cell = app.Tuimux._login_cell
+    # OWNER: "handle@" on the primary row (domain dropped whether given a bare
+    # handle or a full email); blank on secondary sub-rows / when unknown
+    assert owner_cell("miquel", True) == (("miquel@", "dim"),)
+    assert owner_cell("miquel@ersilia.io", True) == (("miquel@", "dim"),)
+    assert owner_cell("miquel", False) == ()
+    assert owner_cell("", True) == ()
+    # tag-owned nodes are not accounts: rendered bare, never "tag:dev@"
+    assert owner_cell("tag:dev", True) == (("tag:dev", "dim"),)
+    assert owner_cell("tagged-devices", True) == (
+        ("tagged-devices", "dim"),
+    )  # fallback
+    assert owner_cell("tag:dev", False) == ()
+    # SSH USER (login, confirmed, mapping): show only when it's a real account —
+    # a box we reached (confirmed), or one you've explicitly mapped a login for.
+    assert login_cell("mduranfrigola", True, "") == (
+        ("mduranfrigola", "dim"),
+    )  # reached
+    assert login_cell("mduranfrigola", False, "mduranfrigola") == (
+        ("mduranfrigola", "dim"),
+    )  # explicitly mapped
+    assert login_cell("mduranfrigola", False, "") == ()  # speculative default → hidden
+    assert login_cell("", True, "") == ()
 
 
 def test_tabs_cell_tints_claude():
@@ -1454,7 +1483,9 @@ def test_offline_host_with_probe_zero_renders_offline():
             "me",
         )
     ]
-    rows = _view_for(hosts, {})  # no probe result
+    rows = _view_org(
+        hosts, {}
+    )  # org scope — a teammate's offline box is hidden by default
     cells, meta = rows[0]
     assert meta["action"] == "none"
     assert "offline" in _cell_text(cells[1]) and "3h ago" in _cell_text(cells[2])
@@ -1488,6 +1519,30 @@ def test_host_color_local_teal_remotes_distinct_and_stable():
     assert _engine_eval("host_color herbert").strip() == herb  # deterministic
 
 
+def test_fleet_palette_excludes_local_teal_band():
+    # The golden-angle palette carves out a band around the local machine's fixed
+    # teal (~166°) so no remote host ever reads as a near-teal look-alike.
+    import colorsys
+
+    def hue(hexs):
+        r, g, b = (int(hexs[i : i + 2], 16) / 255 for i in (1, 3, 5))
+        return colorsys.rgb_to_hls(r, g, b)[0] * 360
+
+    teal = hue("#34d8b1")
+    for i in range(24):
+        c = _engine_eval(f"color_for_index {i}").strip()
+        assert re.match(r"^#[0-9a-f]{6}$", c)
+        d = abs(hue(c) - teal)
+        assert min(d, 360 - d) > 20, f"index {i} → {c} is too close to teal"
+    # the two code paths (color_for_index and hosts_data's inline hsl) must agree
+    rows = [
+        ln.split("\t") for ln in _engine_eval("hosts_data", scope="org").splitlines()
+    ]
+    by = {r[0]: r for r in rows}
+    idx = int(_engine_eval("fleet_index herbert").strip())
+    assert by["herbert"][8] == _engine_eval(f"color_for_index {idx}").strip()
+
+
 def test_hosts_data_emits_color_column():
     rows = [
         ln.split("\t") for ln in _engine_eval("hosts_data", scope="org").splitlines()
@@ -1507,6 +1562,425 @@ def test_view_uses_engine_color_for_machine_header():
     header = rows[0][0]
     styles = _cell_styles(header[0]) + " " + _cell_styles(header[1])
     assert "#abcdef" in styles
+
+
+# ---- multiple logins per host ----------------------------------------------
+def test_login_cli_comma_list_add_and_rm_one_user():
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config")
+        env = {"TUIMUX_CONFIG": cfg, "USER": "miquel"}
+        # set a two-user list; first is the primary
+        _engine_out(["login", "splunk", "mduranfrigola,gturon"], env)
+        assert "splunk=mduranfrigola,gturon" in Path(cfg).read_text()
+        assert _engine_out(["__loginfor", "splunk"], env).strip() == "mduranfrigola"
+        assert (
+            _engine_out(["__loginsfor", "splunk"], env).strip()
+            == "mduranfrigola,gturon"
+        )
+        # --add appends (and dedups)
+        _engine_out(["login", "--add", "splunk", "marina"], env)
+        _engine_out(["login", "--add", "splunk", "gturon"], env)  # dup → no-op
+        assert "splunk=mduranfrigola,gturon,marina" in Path(cfg).read_text()
+        # --rm one user keeps the rest; removing the last drops the token entirely
+        _engine_out(["login", "--rm", "splunk", "gturon"], env)
+        assert "splunk=mduranfrigola,marina" in Path(cfg).read_text()
+        _engine_out(["login", "--rm", "splunk", "mduranfrigola"], env)
+        _engine_out(["login", "--rm", "splunk", "marina"], env)
+        assert "splunk=" not in Path(cfg).read_text()
+
+
+def test_login_cli_rejects_duplicate_user_list():
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config")
+        before = Path(cfg).read_text() if os.path.exists(cfg) else ""
+        r = subprocess.run(
+            ["bash", app.ENGINE, "login", "splunk", "a,a"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "TUIMUX_CONFIG": cfg, "USER": "miquel"},
+        )
+        assert r.returncode != 0
+        assert (Path(cfg).read_text() if os.path.exists(cfg) else "") == before
+
+
+def test_hosts_data_fans_out_multiple_logins():
+    rows = [
+        ln.split("\t")
+        for ln in _engine_eval(
+            "hosts_data",
+            env={"TUIMUX_LOGINS": "herbert=mduran,gturon", "USER": "me"},
+            scope="org",
+        ).splitlines()
+    ]
+    herbert = [r for r in rows if r[0] == "herbert"]
+    assert len(herbert) == 2  # one row per mapped login
+    # login (col 10) + mapping (col 7) + primary (col 11) per row
+    assert [r[9] for r in herbert] == ["mduran", "gturon"]
+    assert [r[6] for r in herbert] == ["mduran", "gturon"]
+    assert [r[10] for r in herbert] == ["1", "0"]  # first is primary
+    assert all(r[7] == "1" for r in herbert)  # both probed
+
+
+def test_hosts_data_offline_and_consumer_do_not_fan_out():
+    # curie is offline, phone is a consumer — even if mapped to several users they
+    # stay a single row (never SSH'd as the extras).
+    rows = [
+        ln.split("\t")
+        for ln in _engine_eval(
+            "hosts_data",
+            env={"TUIMUX_LOGINS": "curie=a,b phone=a,b", "USER": "me"},
+            scope="org",
+        ).splitlines()
+    ]
+    assert len([r for r in rows if r[0] == "curie"]) == 1
+    assert len([r for r in rows if r[0] == "phone"]) == 1
+
+
+def test_view_secondary_login_is_a_subrow_with_its_own_sessions():
+    base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
+    # same host, two logins: primary mduran + secondary gturon (11-col tuples)
+    hosts = [
+        (
+            "herbert",
+            False,
+            "online",
+            "",
+            "compute",
+            "arnau@ersilia.io",
+            "mduran",
+            True,
+            "#abcdef",
+            "mduran",
+            True,
+        ),
+        (
+            "herbert",
+            False,
+            "online",
+            "",
+            "compute",
+            "arnau@ersilia.io",
+            "gturon",
+            True,
+            "#abcdef",
+            "gturon",
+            False,
+        ),
+    ]
+    a = app.Tuimux()
+    a._scope = "org"
+    a._hosts = hosts
+    a._results = {
+        ("herbert", "mduran"): {**base, "sessions": [_session("m1")]},
+        ("herbert", "gturon"): {**base, "sessions": [_session("g1")]},
+    }
+    rows = a._view()
+    metas = [m for _, m in rows]
+    # each session row carries the login it belongs to
+    m1 = next(m for m in metas if m.get("session") == "m1")
+    g1 = next(m for m in metas if m.get("session") == "g1")
+    assert m1["login"] == "mduran" and g1["login"] == "gturon"
+    # the secondary header is a sub-row of the machine (not marked primary): it
+    # groups under the host in NAME and carries its login in the SSH USER column.
+    user_col = app._COLS.index("user")
+    sub = next(
+        c for c, m in rows if m.get("action") == "machine" and not m.get("primary")
+    )
+    assert "herbert" in _cell_text(sub[0])
+    assert _cell_text(sub[user_col]) == "gturon"
+
+
+def test_folder_cell_shows_last_component():
+    assert app._folder("~/Documents/GitHub/tuimux") == "tuimux"
+    assert app._folder("/var/log/") == "log"
+    assert app._folder("~") == "~"
+    assert app._folder("/") == "/"
+    assert app._folder("") == "~"
+
+
+def test_tabs_cell_drops_lone_window_count():
+    # single window → just the command, no "1" prefix; violet when it's claude
+    assert app.Tuimux._tabs_cell("zsh") == (("zsh", "dim"),)
+    assert app.Tuimux._tabs_cell("claude") == (("claude", app.VIOLET),)
+    # multi-window keeps the count and still tints a claude command
+    cell = app.Tuimux._tabs_cell("3  claude")
+    assert cell[0] == ("3  ", "dim") and cell[1] == ("claude", app.VIOLET)
+
+
+def test_waiting_state_blinks_running_and_idle_do_not():
+    assert "blink" in app._STATE_STYLE["waiting"]
+    assert app.AMBER in app._STATE_STYLE["waiting"]
+    assert "blink" not in app._STATE_STYLE["running"]
+    assert "blink" not in app._STATE_STYLE["idle"]
+
+
+# ---- access-based default view (scope filter) ------------------------------
+def _acc_hosts():
+    # local + reachable-teammate + unreachable-teammate, all 11-col tuples
+    return [
+        ("mybox", True, "online", "", "compute", "me", "", True, "#111", "me", True),
+        (
+            "reach",
+            False,
+            "online",
+            "",
+            "compute",
+            "arnau",
+            "",
+            True,
+            "#222",
+            "me",
+            True,
+        ),
+        (
+            "noacc",
+            False,
+            "online",
+            "",
+            "compute",
+            "gemma",
+            "",
+            True,
+            "#333",
+            "me",
+            True,
+        ),
+    ]
+
+
+def _hdr_hosts(rows):
+    # the set of hosts that produced a machine-header row (session None); the
+    # separator divider has host None and is skipped.
+    return {m["host"] for _, m in rows if m.get("session") is None and m.get("host")}
+
+
+def test_default_view_shows_reachable_hides_unreachable_teammate():
+    base = {"busy": False, "notmux": False, "awake": False}
+    results = {
+        "mybox": {**base, "reachable": True, "sessions": []},
+        "reach": {**base, "reachable": True, "sessions": []},
+        "noacc": {**base, "reachable": False, "sessions": []},
+    }
+    # default (mine): local + the teammate box you can reach; the one you can't is hidden
+    assert _hdr_hosts(_view_for(_acc_hosts(), results)) == {"mybox", "reach"}
+    # org (o): the whole fleet, including the box you can't log into
+    assert _hdr_hosts(_view_org(_acc_hosts(), results)) == {"mybox", "reach", "noacc"}
+
+
+def test_default_view_keeps_own_offline_and_no_ssh():
+    base = {"busy": False, "notmux": False, "awake": False}
+    hosts = [
+        ("mybox", True, "online", "", "compute", "me", "", True, "#111", "me", True),
+        (
+            "mine-off",
+            False,
+            "offline",
+            "2h",
+            "compute",
+            "me",
+            "",
+            False,
+            "#222",
+            "me",
+            True,
+        ),
+        (
+            "mine-nossh",
+            False,
+            "online",
+            "",
+            "compute",
+            "me",
+            "",
+            True,
+            "#333",
+            "me",
+            True,
+        ),
+    ]
+    results = {
+        "mybox": {**base, "reachable": True, "sessions": []},
+        "mine-nossh": {**base, "reachable": False, "sessions": []},  # SSH not working
+    }
+    # your own machines stay visible whatever their SSH state (offline / no-ssh)
+    assert {"mybox", "mine-off", "mine-nossh"} <= _hdr_hosts(_view_for(hosts, results))
+
+
+def test_own_phone_shown_teammate_phone_hidden_until_o():
+    base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
+    hosts = [
+        ("mybox", True, "online", "", "compute", "me", "", True, "#111", "me", True),
+        # your own phone: not SSH-able, but yours → always shown (below the line)
+        (
+            "myphone",
+            False,
+            "online",
+            "",
+            "consumer",
+            "me",
+            "",
+            False,
+            "#222",
+            "me",
+            True,
+        ),
+        # a teammate's phone: hidden by default, only under "o"
+        (
+            "herphone",
+            False,
+            "online",
+            "",
+            "consumer",
+            "gemma",
+            "",
+            False,
+            "#333",
+            "me",
+            True,
+        ),
+    ]
+    results = {"mybox": {**base, "sessions": []}}
+    mine = _hdr_hosts(_view_for(hosts, results))
+    assert "mybox" in mine and "myphone" in mine  # your own devices always show
+    assert "herphone" not in mine  # someone else's phone is hidden by default
+    assert "herphone" in _hdr_hosts(_view_org(hosts, results))  # revealed under "o"
+
+
+def test_separator_only_under_o_divides_yours_from_others():
+    base = {"busy": False, "notmux": False, "awake": False}
+    hosts = [
+        ("mybox", True, "online", "", "compute", "me", "", True, "#111", "me", True),
+        # a teammate box you can't reach — hidden by default, shown only under "o"
+        (
+            "theirs",
+            False,
+            "online",
+            "",
+            "compute",
+            "gemma",
+            "",
+            True,
+            "#222",
+            "me",
+            True,
+        ),
+    ]
+    results = {
+        "mybox": {**base, "reachable": True, "sessions": []}
+    }  # theirs unreachable
+    # default: just your box, no divider (nothing below the line)
+    default = _view_for(hosts, results)
+    assert _hdr_hosts(default) == {"mybox"}
+    assert not any(m.get("action") == "separator" for _, m in default)
+    # under "o": the teammate box appears below a single inert divider
+    org = _view_org(hosts, results)
+    seps = [m for _, m in org if m.get("action") == "separator"]
+    assert len(seps) == 1 and seps[0]["host"] is None
+    assert _hdr_hosts(org) == {"mybox", "theirs"}
+
+
+def test_no_ssh_hint_adapts_to_owner():
+    base = {"reachable": False, "busy": False, "notmux": False, "awake": False}
+    folder = app._COLS.index("folder")
+    hosts = [
+        ("mybox", True, "online", "", "compute", "me", "", True, "#111", "me", True),
+        ("mine-x", False, "online", "", "compute", "me", "", True, "#222", "me", True),
+        (
+            "their-x",
+            False,
+            "online",
+            "",
+            "compute",
+            "gemma",
+            "",
+            True,
+            "#333",
+            "me",
+            True,
+        ),
+    ]
+    results = {
+        "mybox": {**base, "reachable": True, "sessions": []},
+        "mine-x": {**base, "sessions": []},  # my box, SSH not working
+        "their-x": {**base, "sessions": []},  # teammate box, no account for me
+    }
+    rows = _view_org(hosts, results)
+    hint = {
+        m["host"]: _cell_text(c[folder])
+        for c, m in rows
+        if m.get("session") is None and m.get("host")
+    }
+    assert hint["mine-x"] == "tailscale up --ssh"  # your own box → enable SSH there
+    assert "press u" in hint["their-x"]  # teammate box → map a login
+
+
+def test_running_state_animates_ellipsis():
+    base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
+    hosts = [
+        ("mybox", True, "online", "", "compute", "me", "", True, "#111", "me", True)
+    ]
+    state_col = app._COLS.index("state")
+
+    def state_word(sess_state, tick):
+        a = app.Tuimux()
+        a._hosts = hosts
+        a._results = _rekey(
+            hosts, {"mybox": {**base, "sessions": [_session("job", state=sess_state)]}}
+        )
+        a._tick = tick
+        c = next(c for c, m in a._view() if m.get("session") == "job")
+        return _cell_text(c[state_col])
+
+    # "running" grows a cycling ellipsis with the animation tick
+    assert state_word("running", 0) == "running"
+    assert state_word("running", 1) == "running."
+    assert state_word("running", 3) == "running..."
+    assert state_word("running", 4) == "running"  # wraps
+    # other states are static regardless of tick
+    assert state_word("idle", 2) == "idle"
+
+
+def test_kick_rechecks_failed_hosts_sparingly():
+    # A box that refused SSH is retried only every RECHECK; reachable boxes every tick.
+    a = app.Tuimux()
+    probed = []
+    a._probe_one = lambda h, key: probed.append(key)
+    a._render = lambda: None
+    a._scan_windows = lambda: None
+    host = (
+        "box",
+        False,
+        "online",
+        "",
+        "compute",
+        "arnau",
+        "",
+        True,
+        "#fff",
+        "me",
+        True,
+    )
+    key = ("box", "me")
+
+    # known-unreachable + just probed → skipped
+    a._results[key] = {"reachable": False, "busy": False}
+    a._last_probe[key] = app.time.monotonic()
+    a._kick([host])
+    assert key not in probed
+
+    # known-unreachable but stale → rechecked
+    a._last_probe[key] = app.time.monotonic() - app.RECHECK - 1
+    a._probing.clear()
+    a._kick([host])
+    assert key in probed
+
+    # reachable → always re-probed, even right after a probe (sessions change)
+    probed.clear()
+    a._probing.clear()
+    a._results[key] = {"reachable": True, "busy": False}
+    a._last_probe[key] = app.time.monotonic()
+    a._kick([host])
+    assert key in probed
 
 
 if __name__ == "__main__":

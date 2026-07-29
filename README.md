@@ -1,112 +1,53 @@
-# A TUI for tmux across tailnet
+# A TUI for Ersilia's Tailnet
 
-See and jump into every tmux session on every machine on your
-[Tailscale](https://tailscale.com) tailnet, from one dashboard — over Tailscale SSH.
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
+
+A terminal dashboard to see, open, and keep awake `tmux` sessions across every
+machine on Ersilia's [Tailscale](https://tailscale.com) tailnet — over Tailscale SSH, from
+one screen.
+
+Built for [Ersilia](https://ersilia.io), where work is spread across shared laptops,
+workstations, and servers on a private tailnet.
 
 ## Requirements
 
-- **`tmux`** — required; tuimux is a front-end for it and refuses to start
-  without it (`brew install tmux`, `sudo apt install tmux`, `sudo dnf install tmux`).
-- `ssh`, `tailscale`, and a terminal.
+- `tmux` (required — tuimux is a front-end for it), plus `ssh`, `tailscale`, and a terminal.
 - Python ≥ 3.9.
 
 ## Install
 
 ```sh
-pip install .          # or: pipx install .
+pip install git+https://github.com/ersilia-os/tuimux
 ```
 
-Needs `tmux`, `ssh`, `tailscale`, and a terminal. Opening sessions in new
-tabs/windows is supported on:
-
-- **macOS** — **Ghostty** (recommended) and **Apple Terminal.app**; any other
-  terminal falls back to Terminal.app.
-- **Linux** — **GNOME Terminal** (real tabs + windows), or **any** terminal via a
-  `TUIMUX_TERM_CMD` template (e.g. `kitty -e sh -c {cmd}`). Jumping to an
-  already-open session and the "OPEN IN" column additionally need **X11** with
-  `wmctrl` (or `xdotool`) installed — on Wayland every open is a new surface.
-
-Force a driver with `TUIMUX_TERM` and override platform detection with `TUIMUX_OS`
-if needed. Run `tuimux doctor` to see what's detected. On each remote machine:
-`sudo tailscale up --ssh` and install `tmux`.
-
-## Use
+## Usage
 
 ```sh
-tuimux                      # the dashboard — all you normally need
-tuimux attach [name]        # put this terminal into a tmux session (attach or create)
-tuimux detach               # detach this terminal; the session keeps running
-tuimux autostart on|off|status  # auto-attach EVERY new local terminal to its own session
-tuimux mouse on|off|status  # tmux mouse mode: wheel scrolls the pane, not shell history
-tuimux init <host>          # auto-tmux a remote's SSH logins
-tuimux login [host user]    # show/set the SSH username per host (--rm host to clear)
-tuimux devices              # list every device in the tailnet (the team fleet)
-tuimux doctor               # check setup
+tuimux                              # the dashboard — all you normally need
+tuimux attach [name]                # put this terminal into a tmux session (attach or create)
+tuimux detach                       # detach this terminal; the session keeps running
+tuimux autostart on|off|status      # auto-tmux every new local terminal
+tuimux mouse on|off|status          # tmux mouse mode (wheel scrolls the pane)
+tuimux login [host user[,user…]]    # show/set the SSH user(s) per host
+tuimux devices                      # list every device in the tailnet
+tuimux doctor                       # check your setup
 ```
 
-Open / rename / detach / close / keep-awake all happen in the dashboard (footer
-lists the keys). Any tmux session shows up regardless of how it was started. As
-you move the cursor, a panel under the table shows a **live preview** of the
-highlighted session's pane — a read-only glimpse of what it's doing without
-attaching; press **`v`** to hide or show it.
+Open, rename, detach, close, and keep-awake all happen inside the dashboard. The footer lists the keys, and a live preview of the highlighted session shows under the table.
 
-**Shared machines & the team fleet.** By default the dashboard shows your own
-machines. Press **`o`** to toggle the **org fleet view** — every device in the
-tailnet, whoever owns it, with non-compute ones (phones, etc.) grouped as
-status-only. On a shared box where your account isn't your local `$USER` (say you
-log into `herbert` as `mduran`), press **`u`** on that row to set the SSH username
-tuimux connects as — or run `tuimux login herbert mduran`. Once mapped, a host
-always appears in your list (even if a teammate owns it) and tuimux probes it as
-your user, so you see *your* tmux sessions there. Unmapped fleet machines are
-listed but not contacted until you give them a login.
+## Setup conventions
 
-Access stays **passwordless** — tuimux only stores the *username*, never a
-secret. You still need permission to log in: a Tailscale SSH ACL that lets you
-assume that remote user, or your key in that user's `~/.ssh/authorized_keys`.
-Teammates each run their own tuimux, mapping the shared box to their own account.
+`tuimux` assumes a small, consistent tailnet. The simplest way to have everything work from the start:
 
-**`tuimux autostart on`** makes every new terminal you open (any app — Ghostty,
-Terminal.app, GNOME Terminal, …) drop straight into its own fresh tmux session, so
-it persists and appears in the dashboard without running `attach` by hand. It adds a
-small guarded block to your shell rc (`~/.zshrc` etc.); `off` removes it, `status`
-shows the state. Skip it for one shell with `TUIMUX_NO_AUTOTMUX=1 <command>`.
+- **Enable Tailscale SSH on every computer** — `sudo tailscale up --ssh`. Phones and tablets are status-only (never SSH'd).
+- **Use the same SSH username (and password) on all machines.** `tuimux` logs in as your local `$USER` by default, so a consistent username makes every box reachable with no per-host setup. Override per host with `tuimux login` when needed.
+- **Give each device a tailnet name matching its hostname**, so the dashboard names line up with the machines.
+- **Tag shared machines that several people log into with `tag:dev`** — the Tailscale ACL tag we use for inbound multi-user access.
 
-**`tuimux mouse on`** turns on tmux mouse mode so the trackpad/wheel scrolls the
-pane's scrollback instead of being sent to the shell as history. It persists the
-setting in `~/.tmux.conf` *and* applies it to the running tmux server, so it takes
-effect immediately; `off` reverts it, `status` shows the state. With it on, to
-select/copy using the terminal's *native* selection, hold **Shift** while dragging
-(Ghostty, iTerm2, GNOME Terminal; **Option** on Apple Terminal).
+## About the Ersilia Open Source Initiative
 
-**On the first run, both `autostart` and `mouse` are enabled for you** (a one-time
-setup — it never repeats, so turning either `off` later sticks). The dashboard's
-bottom border shows the current state: `autostart: …  ·  mouse scroll: …`.
+The [Ersilia Open Source Initiative](https://ersilia.io) is a tech non-profit with the mission to equip laboratories universities, and clinics in the Global South with AI/ML
+tools for infectious and neglected tropical disease research.
 
-The dashboard itself must run **outside** tmux. You don't have to think about it:
-type **`tuimux`** from anywhere — if you happen to be inside a tmux session (e.g.
-because autostart put you there), it detaches that client and relaunches the
-dashboard **in the same window**. If that session was just a throwaway (a lone
-autostart shell — one window, one pane, no other client) it's discarded too, so it
-doesn't clutter the list; a session with real work (extra windows/panes, or shared
-with another client) is only detached and keeps running.
-
-**Opening a session** lands in a new tab **next to the dashboard** (not in whatever
-window happens to be frontmost), or in a new window if you ask for one. If a session
-is already open on this machine, the menu offers **"go to its tab"** instead of
-opening a duplicate.
-
-**The "OPEN IN" column** tells you where you can reach the session. If it's open
-as a tab on **this machine** it says so and stops — `this window` (a tab in the
-dashboard's own window) or `other window` — because you can just jump to it. If
-it isn't open here (`—`) it reports its attachment **on the host that runs it**:
-`N clients` when something else holds it (e.g. a teammate attached on a shared
-box), or `detached` when nothing is. So `— · 2 clients` is a session you have no
-local tab for but that two clients are in, and `— · detached` is idle and free to
-open fresh.
-
-**When a machine goes offline** (asleep, off the network, or shut down) its sessions
-don't vanish — they stay listed, dimmed, marked **`unreachable`**, showing what was
-last running. tmux can't tell "asleep" from "shut down" while a machine is away, so
-the honest answer comes on **reconnect**: each session is briefly tagged **`resumed`**
-(the same session survived — its process kept running) or a remembered one is flagged
-**`lost`** (it was shut down / tmux restarted). This memory is in-process only.
+`tuimux` is internal tooling we built to work comfortably across our shared machines, shared here in case it helps others too.
