@@ -8,7 +8,6 @@ purely the front-end, calling it for data and actions.
 
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -25,7 +24,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Header, Footer, DataTable, Label, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from .cli import relaunch_argv, tuimux_bin
+from .cli import tuimux_bin
 
 ENGINE = str(files("tuimux").joinpath("engine.sh"))
 # TUIMUX_BIN tells the engine its own absolute path, so sessions it spawns into
@@ -1519,91 +1518,19 @@ class Tuimux(App):
         )
 
 
-def _disposable_tmux_session():
-    """Name of the current tmux session iff it's a throwaway worth removing
-    rather than leaving detached: a single-pane, single-window session with no
-    other client attached — i.e. the kind `autostart` spins up for a fresh
-    terminal. Anything with more structure (extra windows/panes, or a client
-    attached elsewhere) returns None and is only ever detached, never killed, so
-    real work is never destroyed."""
-    fmt = "#{session_name}\t#{session_windows}\t#{window_panes}\t#{session_attached}"
-    try:
-        out = subprocess.run(
-            ["tmux", "display-message", "-p", fmt],
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except OSError:
-        return None
-    parts = out.split("\t")
-    # 1 window, 1 pane, exactly this one client → safe to discard
-    return parts[0] if len(parts) == 4 and parts[1:] == ["1", "1", "1"] else None
-
-
 def run():
-    """Entry point: launch the dashboard. tuimux must run *outside* tmux (it
-    drives tmux; nesting it inside a session is meaningless). So if you type
-    `tuimux` from within a tmux client, detach that client and relaunch the
-    dashboard in the SAME terminal window: `detach-client -E` replaces the
-    client with our command. If the session we were in is a throwaway (a lone
-    autostart shell), the relaunch also kills it — running from the freed
-    terminal, so it's safe — instead of leaving it cluttering the dashboard.
-
-    `detach-client -E` runs its command in a FRESH shell that doesn't inherit the
-    environment you had inside tmux — so we carry this process's own environment
-    (which is exactly that tmux-session environment) across the handoff via `env`.
-    Without it the dashboard would start but its PATH would be missing the tmux
-    shell's tools (tailscale/tmux/ssh, often in a conda/venv), so nothing would be
-    reachable. Falls back to a plain message if the handoff can't be performed."""
+    """Entry point: launch the dashboard. tuimux must run *outside* tmux — it
+    drives tmux, so nesting it inside a session is meaningless. Rather than try to
+    escape the session on the user's behalf (fragile), refuse and point them at
+    `tuimux detach`, which frees THIS terminal while the session keeps running in
+    the background — so they can just reopen the dashboard right here."""
     if os.environ.get("TMUX"):
-        sess = _disposable_tmux_session()
-        cleanup = (
-            f"tmux kill-session -t {shlex.quote(sess)} 2>/dev/null; " if sess else ""
-        )
-        # Carry the current environment into the freed terminal so tuimux and the
-        # tools it shells out to are found. The tmux markers must be actively UNSET
-        # (`env -u`), not merely omitted: `env` inherits the ambient environment, and
-        # the freed terminal still has $TMUX set — leave it and the relaunched
-        # dashboard thinks it's *still* inside tmux, loops on the (now clientless)
-        # detach, and exits to a bare shell. Skip non-identifier keys too — bash
-        # exports its functions as names like `BASH_FUNC_x%%`, which `env NAME=…`
-        # rejects.
-        _TMUX_ENV = {"TMUX", "TMUX_PANE", "TMUX_TMPDIR"}
-        unset = " ".join(f"-u {k}" for k in _TMUX_ENV)
-        envp = " ".join(
-            f"{k}={shlex.quote(v)}"
-            for k, v in os.environ.items()
-            if k.isidentifier() and k not in _TMUX_ENV
-        )
-        # Quote each argv token separately: relaunch_argv() may be a multi-word
-        # `python -m tuimux`, which a single shlex.quote() would mangle into one
-        # bogus "python -m tuimux" command name.
-        cmd = " ".join(shlex.quote(a) for a in relaunch_argv())
-        relaunch = f"{cleanup}exec env {unset} {envp} TUIMUX_NO_AUTOTMUX=1 {cmd}"
-        # A quick heads-up that we're leaving tmux, before the client detaches.
-        print(
-            "tuimux: leaving this tmux session to open the dashboard "
-            "(it keeps running — `tmux attach` to return)…",
-            file=sys.stderr,
-        )
-        try:
-            ok = (
-                subprocess.run(
-                    ["tmux", "detach-client", "-E", relaunch],
-                    stderr=subprocess.DEVNULL,
-                ).returncode
-                == 0
-            )
-        except OSError:
-            ok = False
-        if ok:
-            # detach-client returns 0 once the detach is queued — before the -E
-            # command execs — so this confirms the handoff started, not that the
-            # dashboard came up. A broken tuimux_bin() would leave a bare shell;
-            # that's inherent to -E and the same failure you'd get launching by hand.
-            return
         raise SystemExit(
-            "Don't run tuimux inside tmux — open it in a plain terminal tab."
+            "tuimux can't run inside tmux — it drives tmux, so a dashboard nested in\n"
+            "a session can't work. Detach this terminal first, then reopen it:\n"
+            "\n"
+            "    tuimux detach     (your tmux session keeps running in the background)\n"
+            "    tuimux"
         )
     Tuimux().run()
 

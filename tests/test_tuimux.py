@@ -17,8 +17,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from tuimux import app  # noqa: E402
-from tuimux import cli  # noqa: E402
-from tuimux.cli import relaunch_argv, tuimux_bin  # noqa: E402
+from tuimux.cli import tuimux_bin  # noqa: E402
 
 # Hermetic env: tuimux exports several TUIMUX_* vars into the shells it spawns (e.g.
 # TUIMUX_SELF_HOST when you run inside a tuimux session). If the test runner inherits
@@ -100,22 +99,6 @@ def test_auto_name():
 def test_tuimux_bin_is_absolute_or_name():
     got = tuimux_bin()
     assert got == "tuimux" or got.endswith("tuimux")
-
-
-def test_relaunch_argv_falls_back_to_module_when_no_console_script(monkeypatch):
-    # When tuimux is launched as `python -m tuimux` there's no console script on
-    # PATH, so tuimux_bin() returns the bare name "tuimux". The relaunch must NOT
-    # use that bare name — under tmux's detach-client -E it runs in a non-login
-    # shell whose PATH lacks the venv, so it'd be `command not found` and freeze
-    # the terminal. Fall back to the current interpreter + module instead.
-    monkeypatch.setattr(cli, "tuimux_bin", lambda: "tuimux")
-    assert relaunch_argv() == [sys.executable, "-m", "tuimux"]
-
-
-def test_relaunch_argv_uses_resolved_console_script(monkeypatch):
-    # An installed console script (a real absolute path) is used verbatim.
-    monkeypatch.setattr(cli, "tuimux_bin", lambda: sys.executable)
-    assert relaunch_argv() == [sys.executable]
 
 
 # ---- CLI: attach / detach (replaced the old `here`) -------------------------
@@ -891,133 +874,46 @@ def test_waiting_agent_is_amber_working_is_not():
     assert app.AMBER not in state["k"]  # working is calm
 
 
-def test_disposable_tmux_session():
-    orig = app.subprocess.run
-    try:
-        # 1 window / 1 pane / 1 client → disposable, returns the name
-        app.subprocess.run = lambda *a, **k: SimpleNamespace(
-            stdout="dev\t1\t1\t1\n", returncode=0
-        )
-        assert app._disposable_tmux_session() == "dev"
-        # extra window → not disposable
-        app.subprocess.run = lambda *a, **k: SimpleNamespace(
-            stdout="dev\t2\t1\t1\n", returncode=0
-        )
-        assert app._disposable_tmux_session() is None
-        # a second client → not disposable (someone else is attached)
-        app.subprocess.run = lambda *a, **k: SimpleNamespace(
-            stdout="dev\t1\t1\t2\n", returncode=0
-        )
-        assert app._disposable_tmux_session() is None
-        # malformed / empty output → safely None, never raises
-        app.subprocess.run = lambda *a, **k: SimpleNamespace(stdout="\n", returncode=0)
-        assert app._disposable_tmux_session() is None
-    finally:
-        app.subprocess.run = orig
-
-
 # ---- run(): tuimux must never nest inside tmux ------------------------------
 @contextlib.contextmanager
-def _patched_run(returncode, tmux, session_info="dev\t2\t1\t1"):
-    """Stub subprocess.run + Tuimux + $TMUX so run() can be exercised offline.
-
-    `session_info` is what `tmux display-message` returns for the disposable
-    check (name\\twindows\\tpanes\\tclients); the default (2 windows) is NOT
-    disposable. Yields (calls, launched): the tmux commands issued, and whether
-    the dashboard was started in-process."""
-    calls, launched = [], []
-    orig_run, orig_tuimux = app.subprocess.run, app.Tuimux
+def _patched_run(tmux):
+    """Stub Tuimux + $TMUX so run() can be exercised offline. Yields `launched`:
+    whether the dashboard was actually started in-process."""
+    launched = []
+    orig_tuimux = app.Tuimux
     had_tmux = "TMUX" in os.environ
     prev_tmux = os.environ.get("TMUX")
-
-    def fake_run(cmd, **kw):
-        calls.append(cmd)
-        if "display-message" in cmd:
-            return SimpleNamespace(stdout=session_info + "\n", returncode=0)
-        return SimpleNamespace(returncode=returncode, stdout="")
-
-    app.subprocess.run = fake_run
     app.Tuimux = lambda: SimpleNamespace(run=lambda: launched.append(True))
     if tmux is None:
         os.environ.pop("TMUX", None)
     else:
         os.environ["TMUX"] = tmux
     try:
-        yield calls, launched
+        yield launched
     finally:
-        app.subprocess.run, app.Tuimux = orig_run, orig_tuimux
+        app.Tuimux = orig_tuimux
         if had_tmux:
             os.environ["TMUX"] = prev_tmux
         else:
             os.environ.pop("TMUX", None)
 
 
-def _detach_cmd(calls):
-    return next(c for c in calls if c[:2] == ["tmux", "detach-client"])
-
-
-def test_run_inside_tmux_detaches_and_relaunches_same_window():
-    # 2-window session → NOT disposable → detach only, never killed
-    with _patched_run(returncode=0, tmux="/tmp/tmux-501/default,9,0") as (
-        calls,
-        launched,
-    ):
-        app.run()
-    # never starts the dashboard in this (inside-tmux) process …
-    assert launched == []
-    # … instead it detaches this client and hands the window off to a fresh tuimux
-    detach = _detach_cmd(calls)
-    assert detach[2] == "-E"
-    handoff = detach[3]
-    assert "TUIMUX_NO_AUTOTMUX=1" in handoff and "exec" in handoff
-    assert "kill-session" not in handoff  # preserved, not killed
-
-
-def test_run_inside_tmux_kills_disposable_session():
-    # 1 window / 1 pane / 1 client → a throwaway autostart shell → cleaned up
-    with _patched_run(returncode=0, tmux="x", session_info="happy-curie\t1\t1\t1") as (
-        calls,
-        launched,
-    ):
-        app.run()
-    assert launched == []
-    handoff = _detach_cmd(calls)[3]
-    # kills the throwaway session first, then relaunches the dashboard
-    assert handoff.index("kill-session -t happy-curie") < handoff.index("exec")
-    assert "TUIMUX_NO_AUTOTMUX=1" in handoff
-
-
-def test_run_inside_tmux_handoff_is_runnable_for_python_m_launch(monkeypatch):
-    # Regression: launched as `python -m tuimux`, the relaunch must be a real
-    # runnable command (`<python> -m tuimux`) with each token quoted separately —
-    # not a single bogus "python -m tuimux" word, and never the bare `tuimux`
-    # that froze the terminal under detach-client -E.
-    monkeypatch.setattr(
-        app, "relaunch_argv", lambda: ["/opt/py/python3", "-m", "tuimux"]
-    )
-    with _patched_run(returncode=0, tmux="x") as (calls, launched):
-        app.run()
-    assert launched == []
-    handoff = _detach_cmd(calls)[3]
-    assert "/opt/py/python3 -m tuimux" in handoff  # runnable, tokens quoted separately
-    assert "'/opt/py/python3 -m tuimux'" not in handoff  # not collapsed to one token
-
-
-def test_run_inside_tmux_falls_back_when_detach_fails():
-    with _patched_run(returncode=1, tmux="x") as (_calls, launched):
+def test_run_inside_tmux_refuses_and_recommends_detach():
+    with _patched_run(tmux="/tmp/tmux-501/default,9,0") as launched:
         try:
             app.run()
         except SystemExit as e:
-            assert "inside tmux" in str(e)
+            msg = str(e)
         else:
-            raise AssertionError("expected SystemExit when detach-client fails")
-    assert launched == []  # didn't start the app inside tmux either
+            raise AssertionError("expected SystemExit when run inside tmux")
+    assert launched == []  # never opens a dashboard nested in the session
+    assert "tuimux detach" in msg  # the one recommended way out
 
 
 def test_run_outside_tmux_launches_dashboard():
-    with _patched_run(returncode=0, tmux=None) as (calls, launched):
+    with _patched_run(tmux=None) as launched:
         app.run()
-    assert launched == [True] and calls == []  # no tmux handoff needed
+    assert launched == [True]
 
 
 # ---- Linux spawn command builder (engine.sh) --------------------------------
@@ -1981,23 +1877,6 @@ def test_kick_rechecks_failed_hosts_sparingly():
     a._last_probe[key] = app.time.monotonic()
     a._kick([host])
     assert key in probed
-
-
-def test_run_inside_tmux_carries_the_environment(monkeypatch):
-    # The freed shell won't have the tmux session's PATH unless we carry it across
-    # the handoff — otherwise the dashboard comes up but can't find tailscale/tmux.
-    # The tmux markers must be dropped so the relaunch isn't seen as still nested.
-    monkeypatch.setenv("PATH", "/opt/conda/envs/x/bin:/usr/bin")
-    with _patched_run(returncode=0, tmux="ZZZ_TMUX_MARKER") as (calls, launched):
-        app.run()
-    assert launched == []
-    handoff = _detach_cmd(calls)[3]
-    assert "exec env " in handoff
-    assert "/opt/conda/envs/x/bin" in handoff  # PATH carried across the handoff
-    assert "ZZZ_TMUX_MARKER" not in handoff  # TMUX value not carried
-    # …and TMUX is actively UNSET, so the relaunched dashboard isn't seen as still
-    # inside tmux (which would loop the handoff and drop to a bare shell).
-    assert "-u TMUX" in handoff
 
 
 if __name__ == "__main__":
