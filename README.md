@@ -8,7 +8,8 @@ machine on Ersilia's [Tailscale](https://tailscale.com) tailnet — over Tailsca
 one screen.
 
 Built for [Ersilia](https://ersilia.io), where work is spread across shared laptops,
-workstations, and servers on a private tailnet.
+workstations, and servers on a private tailnet. It is internal tooling, shared here in case
+it helps others too.
 
 ## Requirements
 
@@ -47,7 +48,6 @@ Open, rename, detach, close, and keep-awake all happen inside the dashboard. The
 
 ## About the Ersilia Open Source Initiative
 
-The [Ersilia Open Source Initiative](https://ersilia.io) is a tech non-profit with the mission to equip laboratories universities, and clinics in the Global South with AI/ML
-tools for infectious and neglected tropical disease research.
+The [Ersilia Open Source Initiative](https://ersilia.io) is a tech-nonprofit organization fueling sustainable research in the Global South. Ersilia's main asset is the [Ersilia Model Hub](https://github.com/ersilia-os/ersilia), an open-source repository of AI/ML models for antimicrobial drug discovery.
 
-`tuimux` is internal tooling we built to work comfortably across our shared machines, shared here in case it helps others too.
+![Ersilia Logo](assets/Ersilia_Brand.png)
