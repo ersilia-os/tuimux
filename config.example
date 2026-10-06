@@ -23,6 +23,12 @@
 # Per-host SSH connect timeout (seconds).
 # TUIMUX_SSH_TIMEOUT=5
 
+# When a remote tab's connection drops (laptop slept, network changed), wait for
+# the host and re-attach the same session in place. If the session was closed on
+# the remote meanwhile, the tab says so and closes. "off" restores the old
+# behaviour (show the error, Enter closes the tab).
+# TUIMUX_RECONNECT=on
+
 # Which terminal to drive when opening sessions in new tabs/windows. Auto-detected;
 # set to force a driver. macOS: ghostty | terminal (Apple Terminal.app).
 # Linux: gnome (GNOME Terminal) | custom (use TUIMUX_TERM_CMD) | generic.

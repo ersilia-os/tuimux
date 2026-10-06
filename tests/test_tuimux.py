@@ -1879,6 +1879,52 @@ def test_kick_rechecks_failed_hosts_sparingly():
     assert key in probed
 
 
+# ---- reconnecting a remote tab after the link drops -------------------------
+# `ssh` is stubbed to return a scripted sequence of exit codes (255 = ssh's own
+# connection failure) and echo the remote command it was asked to run; sleep and
+# the colour lookup are stubbed so the loop runs instantly and headless.
+def _reconnect(codes, mode="exec", env=None):
+    stubs = (
+        f"CODES=({' '.join(map(str, codes))}); N=0; "
+        'ssh(){ echo "SSH ${*: -1}"; local c=${CODES[$N]}; N=$((N+1)); return $c; }; '
+        "sleep(){ :; }; status_style(){ :; }; "
+    )
+    call = f"remote_session remotebox me work 'FIRST' {mode} 2>&1; echo EC=$?"
+    return _engine_func(call, env=env, stubs=stubs)
+
+
+def test_reconnect_reattaches_same_session_after_drop():
+    out = _reconnect([255, 0, 0])  # attach drops → session still there → re-attach
+    assert "connection to remotebox lost" in out
+    assert "SSH tmux has-session -t '=work'" in out
+    assert "tmux attach -t '=work'" in out  # exact match, never `new -A`
+    assert out.strip().endswith("EC=0")
+
+
+def test_reconnect_waits_while_host_is_unreachable():
+    out = _reconnect([255, 255, 255, 0, 0])
+    assert out.count("SSH tmux has-session") == 3
+    assert out.strip().endswith("EC=0")
+
+
+def test_reconnect_reports_session_closed_on_remote():
+    out = _reconnect([255, 1])  # host back, but the session is gone
+    assert "session 'work' was closed on remotebox" in out
+    assert "tmux attach -t '=work'" not in out
+    assert out.strip().endswith("EC=0")  # 0 → the tab closes
+
+
+def test_reconnect_only_on_connection_failure():
+    out = _reconnect([1])  # e.g. no such session: keep the old error path
+    assert "lost" not in out
+    assert out.strip().endswith("EC=1")
+
+
+def test_reconnect_off_or_outside_a_spawned_tab():
+    assert _reconnect([255], env={"TUIMUX_RECONNECT": "off"}).strip().endswith("EC=255")
+    assert _reconnect([255], mode="return").strip().endswith("EC=255")
+
+
 if __name__ == "__main__":
     import inspect
 
