@@ -47,6 +47,9 @@ TUIMUX_LOGIN="${TUIMUX_LOGIN:-$USER}"
 TUIMUX_LOGINS="${TUIMUX_LOGINS:-}"
 TUIMUX_DEFAULT_SESSION="${TUIMUX_DEFAULT_SESSION:-main}"
 TUIMUX_SSH_TIMEOUT="${TUIMUX_SSH_TIMEOUT:-5}"
+# When a remote tab's connection drops (laptop slept, network changed), wait for
+# the host and re-attach the same session in place. "off" closes on error instead.
+TUIMUX_RECONNECT="${TUIMUX_RECONNECT:-on}"
 TUIMUX_REFRESH="${TUIMUX_REFRESH:-3}"          # panel auto-refresh interval (seconds)
 # TERM to use for *remote* interactive sessions. Ghostty's own "xterm-ghostty"
 # terminfo usually isn't installed on other machines, so propagating it makes
@@ -587,6 +590,7 @@ do_attach() {
   local host="$1" login="$2" session="$3" action="$4" mode="${5:-return}" cmd nm
   case "$action" in
     attach) note "attaching to $session on $host (as $login) …"
+            nm="$session"
             cmd="$(tmux_opts)tmux attach -t '$session'" ;;
     new)    nm="$session"; [ "$nm" = "$NEW_SENTINEL" ] && nm="$(docker_name)"
             note "opening session '$nm' on $host (as $login) …"
@@ -598,10 +602,59 @@ do_attach() {
   if is_local "$host"; then
     surface "$mode" sh -c "$cmd"
   else
-    # Force a portable TERM so remote tmux doesn't choke on xterm-ghostty.
-    surface "$mode" env TERM="$TUIMUX_REMOTE_TERM" \
-      ssh -t "${SSH_OPTS[@]}" "$login@$host" "$cmd"
+    surface "$mode" remote_session "$host" "$login" "$nm" "$cmd" "$mode"
   fi
+}
+
+# Interactive ssh into a remote host running <cmd>. Keepalives make a dead link
+# (laptop slept, network changed) exit with 255 in ~30s instead of hanging.
+remote_tty() {
+  local host="$1" login="$2" cmd="$3"
+  # Force a portable TERM so remote tmux doesn't choke on xterm-ghostty.
+  TERM="$TUIMUX_REMOTE_TERM" ssh -t "${SSH_OPTS[@]}" \
+    -o ServerAliveInterval=10 -o ServerAliveCountMax=3 "$login@$host" "$cmd"
+}
+
+# A remote attach. In a spawned tab (exec mode), a dropped connection (ssh's own
+# exit code 255) hands over to remote_reconnect instead of ending the tab.
+remote_session() {
+  local host="$1" login="$2" session="$3" cmd="$4" mode="$5" ec
+  remote_tty "$host" "$login" "$cmd"
+  ec=$?
+  if [ "$ec" -eq 255 ] && [ "$mode" = exec ] && [ "$TUIMUX_RECONNECT" != off ]; then
+    remote_reconnect "$host" "$login" "$session"
+    return
+  fi
+  return "$ec"
+}
+
+# Wait for <host> to come back, then re-attach <session> in place. Each try asks
+# the remote whether the session still exists: if it was closed meanwhile, say so
+# and let the tab close rather than silently creating an empty one. Enter closes
+# the tab at any point. Returns the exit code for surface (0 closes the tab).
+remote_reconnect() {
+  local host="$1" login="$2" session="$3" wait=3 ec cmd
+  cmd="$(status_style "$host" "$login")$(tmux_opts)tmux attach -t '=$session'"
+  printf '\n\033[33m[tuimux] connection to %s lost — reconnecting … (Enter closes this tab)\033[0m\n' "$host" >&2
+  while :; do
+    read -r -t "$wait" _ 2>/dev/null </dev/tty
+    ec=$?
+    [ "$ec" -eq 0 ] && return 0          # Enter: give up, close the tab
+    [ "$ec" -le 128 ] && sleep "$wait"   # no tty / EOF: read didn't wait, so do
+    rssh_as "$login" "$host" "tmux has-session -t '=$session' 2>/dev/null"
+    case $? in
+      255) wait=$((wait * 2)); [ "$wait" -gt 30 ] && wait=30 ;;   # still unreachable
+      0)   note "reconnected to $host."
+           remote_tty "$host" "$login" "$cmd"
+           ec=$?
+           [ "$ec" -eq 255 ] || return "$ec"
+           printf '\n\033[33m[tuimux] connection to %s lost again — reconnecting …\033[0m\n' "$host" >&2
+           wait=3 ;;
+      *)   printf "\n\033[33m[tuimux] session '%s' was closed on %s.\033[0m\n" "$session" "$host" >&2
+           read -r -t 3 _ 2>/dev/null </dev/tty || true
+           return 0 ;;
+    esac
+  done
 }
 
 # Run the attach/new command for a spawned terminal tab/window. In exec mode the
