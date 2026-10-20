@@ -79,8 +79,10 @@ NONE_SENTINEL="__NONE__"
 AWAKE_SESSION="keep-awake"   # dedicated tmux session that holds the keep-awake lock
 
 # No ControlMaster/ControlPersist multiplexing: Tailscale SSH accepts the master
-# connection but then hangs every multiplexed session over it, so each probe just
-# makes its own connection (kept cheap by the per-host, non-overlapping refresh).
+# connection but then hangs every multiplexed session over it. Instead, the
+# dashboard keeps one plain `ssh host sh` open per host (remote.py) and feeds it
+# the scripts from `__remote`, so it pays the ~2s handshake once, not per call.
+# The CLI paths here still make one connection per command.
 SSH_OPTS=(-o ConnectTimeout="$TUIMUX_SSH_TIMEOUT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 
 # ----- helpers ---------------------------------------------------------------
@@ -404,32 +406,34 @@ is_consumer() {
 
 # ----- session probe ---------------------------------------------------------
 # Remote probe: list sessions (S|…) plus which sessions are running Claude (C|…).
-# Claude shows up as a `claude` process under a pane's shell, so we scan pane
-# children — folded into one SSH round-trip.
+# Claude shows up as a `claude` process under a pane's shell. One `ps` listing is
+# joined against the pane pids in awk (a per-pane pgrep/ps loop cost ~0.1s per
+# pane), then only the Claude panes are captured — all in one SSH round-trip.
 REMOTE_PROBE='command -v tmux >/dev/null 2>&1 || { echo __NOTMUX__; exit 0; }
 tmux list-sessions -F "S|#{session_name}|#{?session_attached,1,0}|#{session_windows}|#{pane_current_path}|#{pane_current_command}|#{session_created}" 2>/dev/null
 tmux list-windows -a -F "W|#{session_name}|#{window_index}|#{window_name}|#{?window_active,1,0}" 2>/dev/null
 tmux list-clients -F "L|#{client_session}|#{client_termname}" 2>/dev/null
-tmux list-panes -a -F "#{session_name} #{pane_id} #{pane_pid}" 2>/dev/null | while read s pane ppid; do
-  for ch in $(pgrep -P "$ppid" 2>/dev/null); do
-    case "$(ps -p "$ch" -o comm= 2>/dev/null)" in
-      *claude*)
-        echo "C|$s"
-        # Three states from the visible pane:
-        #   running — "esc to interrupt" shows only while Claude is generating
-        #   waiting — an approval/question prompt is on screen expecting the user
-        #   idle    — Claude is up but nothing is happening (finished, at the box)
-        cap="$(tmux capture-pane -p -t "$pane" 2>/dev/null)"
-        if printf "%s\n" "$cap" | grep -qi "esc to interrupt"; then
-          echo "A|$s|running"
-        elif printf "%s\n" "$cap" | grep -qiE "Do you want|Would you like|❯[[:space:]]*[0-9]|\(y/n\)"; then
-          echo "A|$s|waiting"
-        else
-          echo "A|$s|idle"
-        fi
-        break ;;
-    esac
-  done
+{ tmux list-panes -a -F "P #{pane_pid} #{pane_id} #{session_name}" 2>/dev/null
+  ps -Ao ppid=,comm= 2>/dev/null; } | awk '\''
+  # pane lines come first: pane pid -> "pane_id session" (the name may have spaces)
+  $1 == "P" { r = $0; sub(/^P [^ ]+ /, "", r); pane[$2] = r; next }
+  # then every process: the first claude child of a pane marks that pane
+  ($1 in pane) && !($1 in seen) { c = $0; sub(/^ *[0-9]+ +/, "", c)
+    if (c ~ /claude/) { seen[$1] = 1; print pane[$1] } }
+'\'' | while read -r pane s; do
+  echo "C|$s"
+  # Three states from the visible pane:
+  #   running — "esc to interrupt" shows only while Claude is generating
+  #   waiting — an approval/question prompt is on screen expecting the user
+  #   idle    — Claude is up but nothing is happening (finished, at the box)
+  cap="$(tmux capture-pane -p -t "$pane" 2>/dev/null)"
+  if printf "%s\n" "$cap" | grep -qi "esc to interrupt"; then
+    echo "A|$s|running"
+  elif printf "%s\n" "$cap" | grep -qiE "Do you want|Would you like|❯[[:space:]]*[0-9]|\(y/n\)"; then
+    echo "A|$s|waiting"
+  else
+    echo "A|$s|idle"
+  fi
 done
 true'
 
@@ -580,7 +584,26 @@ probe_host() {
 peek_pane() {
   local host="$1" login="$2" session="$3"
   [ -n "$host" ] && [ -n "$session" ] || return 0
-  rssh_as "$login" "$host" "tmux capture-pane -p -e -t '$session' 2>/dev/null"
+  rssh_as "$login" "$host" "$(remote_script peek "$session")"
+}
+
+# The shell script each remote dashboard action runs on its host. One place for
+# them, shared by the engine's own commands and `__remote` (which prints the
+# script so the dashboard can run it over its persistent per-host shell).
+# Unknown kinds print nothing and fail.
+remote_script() {
+  local kind="${1:-}"; shift
+  case "$kind" in
+    probe)  printf '%s' "$REMOTE_PROBE" ;;
+    peek)   printf "tmux capture-pane -p -e -t '%s' 2>/dev/null" "${1:-}" ;;
+    detach) printf "tmux detach-client -s '%s' 2>/dev/null" "${1:-}" ;;
+    kill)   printf "tmux kill-session -t '%s' 2>/dev/null" "${1:-}" ;;
+    rename) printf "tmux rename-session -t '%s' '%s'" "${1:-}" "${2:-}" ;;
+    awake)  awake_toggle_script ;;
+    # the ssh options, one per line, so the dashboard's shells honour the config
+    sshopts) printf '%s\n' "${SSH_OPTS[@]}" ;;
+    *)      return 1 ;;
+  esac
 }
 
 # ----- attach / new ----------------------------------------------------------
@@ -698,7 +721,7 @@ detach_here() {
 detach_session() {
   local host="$1" login="$2" session="$3"
   case "$session" in "$NEW_SENTINEL"|"$NONE_SENTINEL") return 0 ;; esac
-  rssh_as "$login" "$host" "tmux detach-client -s '$session' 2>/dev/null"
+  rssh_as "$login" "$host" "$(remote_script detach "$session")"
 }
 
 # Open the Tailscale admin console (machines page) in the default browser —
@@ -1103,15 +1126,14 @@ open_surface() {
 }
 
 # ----- keep-awake ------------------------------------------------------------
-# prints: on | off | "" (unreachable)
-awake_state() {
-  rssh_as "$2" "$1" "tmux has-session -t '$AWAKE_SESSION' 2>/dev/null && echo on || echo off" 2>/dev/null
-}
-
-# Turn keep-awake on for a host (OS-appropriate keeper inside a tmux session).
-awake_on() {
-  local host="$1" login="$2" out
-  out="$(rssh_as "$login" "$host" '
+# Flip keep-awake in ONE remote round trip: if the keeper session exists, kill it;
+# otherwise start an OS-appropriate keeper inside it. Prints exactly one of
+# __OFF__ / __ON__ / __UNSUPPORTED__ / __FAIL__.
+awake_toggle_script() {
+  printf '%s' '
+    if tmux has-session -t '"'$AWAKE_SESSION'"' 2>/dev/null; then
+      tmux kill-session -t '"'$AWAKE_SESSION'"' 2>/dev/null; echo __OFF__; exit 0
+    fi
     os=$(uname)
     if [ "$os" = Darwin ]; then
       keeper="caffeinate -dimsu"
@@ -1120,26 +1142,18 @@ awake_on() {
     else
       echo __UNSUPPORTED__; exit 0
     fi
-    tmux new -d -s '"'$AWAKE_SESSION'"' $keeper 2>/dev/null && echo __ON__ || echo __FAIL__
-  ' 2>/dev/null)"
-  case "$out" in
-    *__ON__*)          note "$host: keep-awake ON" ;;
-    *__UNSUPPORTED__*) err  "$host: no supported keep-awake method (need caffeinate or systemd-inhibit)" ;;
-    *)                 err  "$host: failed to enable keep-awake" ;;
-  esac
-}
-
-awake_off() {
-  rssh_as "$2" "$1" "tmux kill-session -t '$AWAKE_SESSION' 2>/dev/null" && note "$1: keep-awake OFF"
+    tmux new -d -s '"'$AWAKE_SESSION'"' $keeper 2>/dev/null && echo __ON__ || echo __FAIL__'
 }
 
 toggle_awake() {
-  local host="$1" login="$2" st
-  st="$(awake_state "$host" "$login")"
-  case "$st" in
-    on)  awake_off "$host" "$login" ;;
-    off) awake_on  "$host" "$login" ;;
-    *)   err "$host is unreachable." ;;
+  local host="$1" login="$2" out
+  out="$(rssh_as "$login" "$host" "$(awake_toggle_script)" 2>/dev/null)"
+  case "$out" in
+    *__OFF__*)         note "$host: keep-awake OFF" ;;
+    *__ON__*)          note "$host: keep-awake ON" ;;
+    *__UNSUPPORTED__*) err  "$host: no supported keep-awake method (need caffeinate or systemd-inhibit)" ;;
+    *__FAIL__*)        err  "$host: failed to enable keep-awake" ;;
+    *)                 err  "$host is unreachable." ;;
   esac
 }
 
@@ -1615,8 +1629,10 @@ case "${1:-}" in
   __attach      ) shift; do_attach "${1:-}" "${2:-}" "${3:-}" "${4:-}" exec ;;
   __open        ) shift; open_surface "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
   __detach      ) shift; detach_session "${1:-}" "${2:-}" "${3:-}" ;;
-  __killraw     ) shift; rssh_as "${2:-}" "${1:-}" "tmux kill-session -t '${3:-}' 2>/dev/null" ;;
-  __renameto    ) shift; rssh_as "${2:-}" "${1:-}" "tmux rename-session -t '${3:-}' '${4:-}'" ;;
+  __killraw     ) shift; rssh_as "${2:-}" "${1:-}" "$(remote_script kill "${3:-}")" ;;
+  __renameto    ) shift; rssh_as "${2:-}" "${1:-}" "$(remote_script rename "${3:-}" "${4:-}")" ;;
+  # print (don't run) the remote script for a dashboard action: __remote <kind> [args]
+  __remote      ) shift; remote_script "$@" ;;
   __windows     ) list_windows ;;
   __selfwin     ) self_winid ;;
   __autoname    ) docker_name ;;

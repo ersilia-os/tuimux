@@ -6,16 +6,19 @@ keep-awake, claude/state detection) lives in the bundled `engine.sh`; this is
 purely the front-end, calling it for data and actions.
 """
 
+import atexit
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from importlib.resources import files
 
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -24,6 +27,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Header, Footer, DataTable, Label, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
+from . import remote
 from .cli import tuimux_bin
 
 ENGINE = str(files("tuimux").joinpath("engine.sh"))
@@ -113,6 +117,27 @@ PREVIEW_LINES = 12
 # steady-state light — reachable/own boxes refresh every tick, boxes you have no
 # account on are retried only this often (enough to notice newly-granted access).
 RECHECK = float(os.environ.get("TUIMUX_RECHECK", "60") or 60)
+# Keep one SSH shell open per remote host (remote.py) instead of paying the ~2s
+# Tailscale SSH handshake on every probe/preview/action. "off" = old per-call ssh.
+PERSIST = os.environ.get("TUIMUX_PERSIST", "on").lower() not in ("off", "0", "no")
+# How often (seconds) to re-read the terminal's window/tab titles for OPEN IN. On
+# Ghostty that's an accessibility walk that stalls Ghostty's own redraw (i.e. this
+# dashboard), so it's kept off the refresh tick; it also runs on returning to the
+# dashboard and shortly after you open/detach/close something.
+WINDOWS_EVERY = float(os.environ.get("TUIMUX_WINDOWS_EVERY", "15") or 15)
+# Wait this long after the cursor stops before capturing a preview, so holding an
+# arrow key sends one capture instead of one per row passed.
+PEEK_DEBOUNCE = 0.12
+# Last-known hosts + sessions, saved on exit and shown (dimmed) at the next launch
+# while the real probes run, so the table is useful from the first frame.
+SNAPSHOT = os.path.expanduser("~/.cache/tuimux/snapshot.json")
+# What a row says while an action on it is in flight (until the host is re-probed).
+_PENDING_LABEL = {
+    "kill": "closing…",
+    "detach": "detaching…",
+    "rename": "renaming…",
+    "awake": "☕ …",
+}
 
 
 def _run(args, timeout=None):
@@ -128,6 +153,79 @@ def _run(args, timeout=None):
         # Distinct marker so callers can tell "too slow to answer" apart from a
         # genuine SSH failure (engine prints UNREACHABLE for the latter).
         return subprocess.CompletedProcess(args, 124, "__TIMEOUT__\n", "")
+
+
+# Static remote scripts (probe, keep-awake, ssh options) fetched once from the
+# engine; per-session ones (peek/detach/…) are cheap local engine calls.
+_SCRIPTS = {}
+_POOL = None
+_POOL_LOCK = threading.Lock()  # probe threads race to create the pool at startup
+
+
+def _script(kind, *args):
+    key = (kind, *args)
+    if key in _SCRIPTS:
+        return _SCRIPTS[key]
+    out = _run(["__remote", kind, *args], timeout=HOSTS_TIMEOUT).stdout
+    if kind in ("probe", "awake", "sshopts") and out:
+        _SCRIPTS[key] = out
+    return out
+
+
+def _pool():
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            opts = _script("sshopts").split()
+            _POOL = remote.ShellPool(lambda h, lg: remote.ssh_argv(h, lg, opts))
+            atexit.register(_POOL.close_all)
+        return _POOL
+
+
+def _persistent(host):
+    """True when calls to `host` go over its persistent shell: a remote host,
+    once discovery has told us which host is this machine."""
+    me = _ENV.get("TUIMUX_SELF_HOST")
+    return PERSIST and bool(me) and bool(host) and host != me
+
+
+def _shell(host, login, kind, *args, timeout):
+    """Run the engine's `kind` script on a remote host's persistent shell."""
+    return _pool().get(host, login).run(_script(kind, *args), timeout)
+
+
+# Mutating per-host actions: dashboard kind -> engine command (same arg order).
+_ACTIONS = {
+    "detach": "__detach",
+    "kill": "__killraw",
+    "rename": "__renameto",
+    "awake": "__awaketoggle",
+}
+
+
+def host_action(kind, host, login, *args):
+    """Run a mutating action (detach/kill/rename/awake) on a session's host."""
+    if _persistent(host):
+        _shell(host, login, kind, *args, timeout=ACTION_TIMEOUT)
+    else:
+        _run([_ACTIONS[kind], host, login, *args], timeout=ACTION_TIMEOUT)
+
+
+def peek(host, login, session):
+    """Capture a session's active pane (with colour escapes) for the preview."""
+    if not _persistent(host):
+        return _run(["__peek", host, login, session], timeout=PEEK_TIMEOUT).stdout
+    rc, out = _shell(host, login, "peek", session, timeout=PEEK_TIMEOUT)
+    return out if rc is not None else ""
+
+
+def _probe_stdout(host, login):
+    if not _persistent(host):
+        return _run(["__probe", host, login], timeout=PROBE_TIMEOUT).stdout
+    rc, out = _shell(host, login, "probe", timeout=PROBE_TIMEOUT)
+    if out == remote.TIMEOUT:
+        return "__TIMEOUT__\n"
+    return f"OK\n{out}" if rc == 0 else "UNREACHABLE\n"
 
 
 def fetch_hosts(scope="mine"):
@@ -248,7 +346,7 @@ def probe(host, login):
         "awake": False,
         "sessions": [],
     }
-    lines = _run(["__probe", host, login], timeout=PROBE_TIMEOUT).stdout.splitlines()
+    lines = _probe_stdout(host, login).splitlines()
     if lines and lines[0].strip() == "__TIMEOUT__":
         # SSH is fine, the host is just too loaded to answer within PROBE_TIMEOUT.
         info["busy"] = True
@@ -361,6 +459,45 @@ def _probe_or_offline(h):
         }
         return (h, info)
     return (h, probe(name, login))
+
+
+def save_snapshot(path, hosts, snap):
+    """Write the host list and last-known sessions per (host, login) to `path`."""
+    data = {
+        "hosts": [list(h) for h in hosts],
+        "snap": {f"{h}\t{lg}": v for (h, lg), v in snap.items()},
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_snapshot(path):
+    """Read a snapshot written by `save_snapshot`.
+
+    Returns
+    -------
+    tuple
+        ``(hosts, snap)``; empty if the file is missing or unreadable.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        hosts = [tuple(h) for h in data["hosts"] if len(h) == 11]
+        snap = {}
+        for k, sessions in data["snap"].items():
+            host, _, login = k.partition("\t")
+            for x in sessions:  # uptime was frozen at save time; recompute it
+                x["uptime"] = _uptime(x.get("created", ""))
+            snap[(host, login)] = sessions
+        return hosts, snap
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return [], {}
 
 
 # Table columns in display order. A "cell" is a tuple of (text, style) segments
@@ -585,6 +722,13 @@ class Tuimux(App):
         self._self_win = None
         self._last_input = 0.0  # monotonic time of the last keypress (idle debounce)
         self._last_refresh = 0.0  # monotonic time of the last actual refresh
+        self._last_windows = 0.0  # monotonic time of the last window/tab scan
+        self._peek_timer = None  # pending debounced preview capture
+        # (host, login, session) -> last pane capture, shown instantly on return
+        self._peek_cache = {}
+        # (host, login, session|None) -> (kind, new_name, monotonic start) for an
+        # action in flight; the row shows it until a later probe lands.
+        self._pending = {}
         self._preview = None  # cached Static handle for the live-preview panel
         # (host, session) currently mirrored in the preview, or None when the
         # cursor isn't on a live session. Guards stale peeks and avoids re-peeking
@@ -596,6 +740,36 @@ class Tuimux(App):
         self._scope = "mine"
         # frame counter for the animated "running…" ellipsis (ticked by a timer)
         self._tick = 0
+
+    def on_unmount(self):
+        save_snapshot(SNAPSHOT, self._hosts, self._snap)
+        if _POOL is not None:
+            _POOL.close_all()
+
+    def _restore_snapshot(self):
+        # Paint the last-known table before any probe: online hosts get their
+        # remembered sessions as a "stale" result (dimmed, still actionable) that
+        # the first real probe replaces.
+        hosts, snap = load_snapshot(SNAPSHOT)
+        if not hosts:
+            return
+        self._hosts, self._snap = hosts, snap
+        for h in hosts:
+            key = (h[0], h[9])
+            if h[2] != "offline" and key in snap:
+                self._results[key] = {
+                    "reachable": True,
+                    "busy": False,
+                    "notmux": False,
+                    "awake": False,
+                    "sessions": snap[key],
+                    "stale": True,
+                }
+        self._render()
+
+    def on_app_focus(self, _event: events.AppFocus):
+        # Back from another tab/window: tabs may have opened or closed meanwhile.
+        self._rescan_windows()
 
     def on_key(self, event):
         # Record activity so the periodic refresh can hold off while you navigate.
@@ -666,6 +840,7 @@ class Tuimux(App):
         t.focus()
         self._preview = self.query_one("#preview", Static)
         self._set_preview_idle()
+        self._restore_snapshot()
         self.reload()
         # Heartbeat faster than REFRESH so we notice you've gone quiet promptly;
         # reload() itself enforces the REFRESH cadence and the idle debounce.
@@ -737,7 +912,7 @@ class Tuimux(App):
         # the dialog for the main loop — that churn is what makes menus feel laggy.
         return len(self.screen_stack) > 1
 
-    def reload(self):
+    def reload(self, force=False):
         # Called on every heartbeat. Refresh only when it makes sense:
         #   • not before the table exists, and never while a dialog is up;
         #   • not while you're actively pressing keys (defer < QUIET since the
@@ -747,7 +922,9 @@ class Tuimux(App):
         if self._table is None or self._modal_open():
             return
         now = time.monotonic()
-        if now - self._last_input < QUIET or now - self._last_refresh < REFRESH:
+        if not force and (
+            now - self._last_input < QUIET or now - self._last_refresh < REFRESH
+        ):
             return
         self._last_refresh = now
         self._load_hosts()
@@ -769,6 +946,9 @@ class Tuimux(App):
             if h[1]:  # is_local
                 _ENV["TUIMUX_SELF_HOST"] = h[0]
                 break
+        for h in hosts:  # a remembered host that went offline isn't "usable"
+            if h[2] == "offline" and self._results.get((h[0], h[9]), {}).get("stale"):
+                del self._results[(h[0], h[9])]
         self._render()  # show machines right away, before any probe returns
         now = time.monotonic()
         for h in hosts:
@@ -801,15 +981,43 @@ class Tuimux(App):
             self._last_probe[key] = now
             self._probing.add(key)
             self._probe_one(h, key)
-        self._scan_windows()  # refresh where sessions are open (local, off-thread)
+        if now - self._last_windows >= WINDOWS_EVERY:
+            self._rescan_windows()  # where sessions are open (local, off-thread)
+
+    def _rescan_windows(self):
+        self._last_windows = time.monotonic()
+        self._scan_windows()
+
+    def _reprobe(self, host, login):
+        # Re-probe one machine right away (after an action on it), bypassing the
+        # refresh cadence so the change shows up in about one round trip.
+        key = (host, login)
+        h = next((h for h in self._hosts if (h[0], h[9]) == key), None)
+        if h is None or key in self._probing:
+            return
+        self._last_probe[key] = time.monotonic()
+        self._probing.add(key)
+        self._probe_one(h, key)
 
     @work(thread=True, group="probe")
     def _probe_one(self, h, key):
+        started = time.monotonic()
         _host, info = _probe_or_offline(h)
-        self.call_from_thread(self._got, key, info)
+        self.call_from_thread(self._got, key, info, started)
 
-    def _got(self, key, info):
+    def _got(self, key, info, started=None):
+        # A probe that began after an action reflects its outcome: drop the
+        # pending label. An older probe still in flight must not, or the row
+        # would flicker back to its pre-action state.
+        if started is not None:
+            for pk, (_k, _n, t0) in list(self._pending.items()):
+                if pk[:2] == key and t0 <= started:
+                    del self._pending[pk]
         if info.get("reachable"):
+            live = {s["name"] for s in info["sessions"]}
+            for ck in [k for k in self._peek_cache if k[:2] == key]:
+                if ck[2] not in live:
+                    del self._peek_cache[ck]
             prev = self._results.get(key)
             # Only an actual unreachable→reachable flip reconciles, so routine
             # refreshes never flash verdicts; compare against the snapshot taken
@@ -875,21 +1083,34 @@ class Tuimux(App):
         if key is None:
             self._set_preview_idle()
         else:
-            # Title updates immediately; the body fills in when the capture lands.
+            # Title updates immediately, with the last capture of this session if
+            # we have one; a fresh capture replaces it once the cursor rests.
             self._preview.border_title = f" {key[2]} · {key[0]} "
-            self._peek_one(key)
+            if key in self._peek_cache:
+                self._paint_preview(self._peek_cache[key])
+            else:
+                self._preview.update(Text("  …", style="dim"))
+            if self._peek_timer is not None:
+                self._peek_timer.stop()
+            self._peek_timer = self.set_timer(
+                PEEK_DEBOUNCE, lambda: self._peek_one(key)
+            )
 
     @work(thread=True, exclusive=True, group="peek")
     def _peek_one(self, key):
         host, login, session = key
-        raw = _run(["__peek", host, login, session], timeout=PEEK_TIMEOUT).stdout
+        raw = peek(host, login, session)
         self.call_from_thread(self._show_preview, key, raw)
 
     def _show_preview(self, key, raw):
-        # Ignore a capture that finished after the cursor moved on (exclusive
+        self._peek_cache[key] = raw
+        # Don't paint a capture that finished after the cursor moved on (exclusive
         # workers cancel queued peeks, but one already mid-SSH still returns).
         if not self._preview_on or key != self._preview_key:
             return
+        self._paint_preview(raw)
+
+    def _paint_preview(self, raw):
         # Show the most-recent lines that fit; size.height is 0 until first layout.
         height = self._preview.size.height or PREVIEW_LINES
         lines = _preview_tail(raw, height)
@@ -1175,13 +1396,20 @@ class Tuimux(App):
                 # each remote its own colour, matching the tmux bar), but the STATUS
                 # is a consistent green "usable" signal, not the per-host accent.
                 color = accent
+                # remembered from the last run, not yet re-probed: same rows, dimmed
+                stale = info.get("stale", False)
                 word = ("local" if is_local else "online", GREEN)
+                awake_c = (("☕ awake", AMBER),) if info["awake"] else ()
+                if self._pending_for(host, login, None):
+                    awake_c = ((_PENDING_LABEL["awake"], "dim italic"),)
                 bucket.append(
                     _row(
                         machine,
-                        name=hdr("up", f"bold {color}"),
-                        status=(word,),
-                        state=(("☕ awake", AMBER),) if info["awake"] else (),
+                        name=hdr("checking", "dim")
+                        if stale
+                        else hdr("up", f"bold {color}"),
+                        status=(("checking…", "dim italic"),) if stale else (word,),
+                        state=awake_c,
                         owner=owner_c,
                         user=login_c,
                     )
@@ -1200,7 +1428,7 @@ class Tuimux(App):
                     locs = self._window_locs(s["name"])
                     # Session name carries the device accent (never bold — only the
                     # machine name is). Dim when it's just an idle, unattached shell.
-                    if s["state"] == "idle" and not s["attached"]:
+                    if stale or (s["state"] == "idle" and not s["attached"]):
                         nm_style = "dim"
                     else:
                         nm_style = color
@@ -1209,6 +1437,13 @@ class Tuimux(App):
                     # activity. Other states are static.
                     st = s["state"]
                     st_word = st + "." * (self._tick % 4) if st == "running" else st
+                    state_c = ((st_word, "dim" if stale else _STATE_STYLE.get(st, "")),)
+                    name_c = (("  ", ""), (s["auto"], nm_style))
+                    pend = self._pending_for(host, login, s["name"])
+                    if pend:
+                        state_c = ((_PENDING_LABEL[pend[0]], "dim italic"),)
+                        if pend[1]:  # rename: show the new name right away
+                            name_c = (("  ", ""), (pend[1], "dim italic"))
                     bucket.append(
                         _row(
                             {
@@ -1218,8 +1453,8 @@ class Tuimux(App):
                                 "action": "attach",
                                 "open": bool(locs),
                             },
-                            name=(("  ", ""), (s["auto"], nm_style)),
-                            state=((st_word, _STATE_STYLE.get(st, "")),),
+                            name=name_c,
+                            state=state_c,
                             uptime=((s["uptime"], "dim"),),
                             folder=((_folder(s["dir"]), "dim"),),
                             tabs=self._tabs_cell(s["tabs"]),
@@ -1267,6 +1502,13 @@ class Tuimux(App):
             rows.append(self._separator_row())
         rows.extend(bottom)
         return rows
+
+    def _pending_for(self, host, login, session):
+        """The in-flight action on a row, or None (also once it's long overdue)."""
+        p = self._pending.get((host, login, session))
+        if p and time.monotonic() - p[2] < ACTION_TIMEOUT + PROBE_TIMEOUT:
+            return p
+        return None
 
     @staticmethod
     def _separator_row():
@@ -1363,12 +1605,29 @@ class Tuimux(App):
     def _spawn(self, args):
         subprocess.Popen(["bash", ENGINE, *args], env=_ENV)
 
+    def _act(self, kind, host, login, *args):
+        # Show the action on its row at once ("closing…", the new name, …); the
+        # re-probe after it finishes confirms the real outcome.
+        session = None if kind == "awake" else args[0]
+        new_name = args[1] if kind == "rename" else None
+        self._pending[(host, login, session)] = (kind, new_name, time.monotonic())
+        self._request_render()
+        self._act_worker(kind, host, login, *args)
+
     @work(thread=True)
-    def _act(self, args):
-        # Run a mutating engine command (detach/kill/rename/awake) off the UI
-        # thread so a slow host can't freeze the TUI, then refresh once it's done.
-        _run(args, timeout=ACTION_TIMEOUT)
-        self.call_from_thread(self.reload)
+    def _act_worker(self, kind, host, login, *args):
+        # Run a mutating action (detach/kill/rename/awake) off the UI thread so a
+        # slow host can't freeze the TUI, then re-probe that host at once. Tabs
+        # close/retitle a moment later, so re-read the window titles after that.
+        host_action(kind, host, login, *args)
+        self.call_from_thread(self._reprobe, host, login)
+        self.call_from_thread(self.set_timer, 1.0, self._rescan_windows)
+
+    def _after_open(self):
+        # A new tab takes a moment to appear and retitle (ssh + tmux attach);
+        # look twice so OPEN IN catches up without waiting for the slow cadence.
+        self.set_timer(2.0, self._rescan_windows)
+        self.set_timer(5.0, self._rescan_windows)
 
     # ---- actions ----
     def on_data_table_row_selected(self, _):
@@ -1395,16 +1654,19 @@ class Tuimux(App):
     def action_open(self):
         m = self._cur()
         if m and m["action"] in ("attach", "new"):
+            # "auto" first looks for an existing tab to focus (an AppleScript walk);
+            # skip it when we already know the session isn't open here.
             self._spawn(
                 [
                     "__open",
-                    "auto",
+                    "auto" if m.get("open") else "tab",
                     m["host"],
                     m.get("login", ""),
                     m["session"],
                     m["action"],
                 ]
             )
+            self._after_open()
 
     def action_window(self):
         m = self._cur()
@@ -1419,11 +1681,12 @@ class Tuimux(App):
                     m["action"],
                 ]
             )
+            self._after_open()
 
     def action_detach(self):
         m = self._cur()
         if m and m["action"] == "attach":
-            self._act(["__detach", m["host"], m.get("login", ""), m["session"]])
+            self._act("detach", m["host"], m.get("login", ""), m["session"])
 
     def action_close(self):
         m = self._cur()
@@ -1432,7 +1695,7 @@ class Tuimux(App):
 
         def done(ok):
             if ok:
-                self._act(["__killraw", m["host"], m.get("login", ""), m["session"]])
+                self._act("kill", m["host"], m.get("login", ""), m["session"])
 
         self.push_screen(
             Confirm(
@@ -1452,6 +1715,7 @@ class Tuimux(App):
                     self._spawn(
                         ["__open", "tab", m["host"], m.get("login", ""), name, "new"]
                     )
+                    self._after_open()
 
             self.push_screen(Ask("Name for the new session:"), made)
         else:
@@ -1459,13 +1723,7 @@ class Tuimux(App):
             def renamed(name):
                 if name:
                     self._act(
-                        [
-                            "__renameto",
-                            m["host"],
-                            m.get("login", ""),
-                            m["session"],
-                            name,
-                        ]
+                        "rename", m["host"], m.get("login", ""), m["session"], name
                     )
 
             self.push_screen(Ask(f"Rename “{m['session']}” to:", m["session"]), renamed)
@@ -1477,7 +1735,7 @@ class Tuimux(App):
     def action_awake(self):
         m = self._cur()
         if m and m["host"]:
-            self._act(["__awaketoggle", m["host"], m.get("login", "")])
+            self._act("awake", m["host"], m.get("login", ""))
 
     def action_orgview(self):
         # Flip between the access view (machines you can SSH into) and the whole
@@ -1500,14 +1758,19 @@ class Tuimux(App):
         m = self._cur()
         if not m or not m.get("host") or m.get("consumer"):
             return
-        host = m["host"]
+        self._ask_login(m["host"])
+
+    @work(thread=True)
+    def _ask_login(self, host):
         # the raw comma-list currently mapped for the host (empty if none)
         current = _run(["__loginsfor", host], timeout=HOSTS_TIMEOUT).stdout.strip()
+        self.call_from_thread(self._push_login_dialog, host, current)
 
+    def _push_login_dialog(self, host, current):
         def chosen(users):
             # Empty clears the mapping (engine falls back to the default login);
             # otherwise set the whole comma-list. Reload either way.
-            self._act(["__setlogin", host, users])
+            self._set_login(host, users)
 
         self.push_screen(
             Ask(
@@ -1516,6 +1779,12 @@ class Tuimux(App):
             ),
             chosen,
         )
+
+    @work(thread=True)
+    def _set_login(self, host, users):
+        _run(["__setlogin", host, users], timeout=ACTION_TIMEOUT)
+        # The host list itself changes (new login rows), so refresh everything now.
+        self.call_from_thread(self.reload, True)
 
 
 def run():

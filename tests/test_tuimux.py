@@ -1937,3 +1937,235 @@ if __name__ == "__main__":
         fn()
         print(f"  ok  {fn.__name__}")
     print(f"\n{len(tests)} tests passed")
+
+
+# ---- persistent remote shells (remote.py) -------------------------------------
+# A local `sh` stands in for `ssh host sh`: same stdin protocol, no network.
+from tuimux import remote  # noqa: E402
+
+
+def test_host_shell_runs_scripts_and_survives_exit():
+    sh = remote.HostShell(["sh"])
+    try:
+        assert sh.run("echo hi", 5) == (0, "hi\n")
+        # an `exit` inside a script (the probe has one) ends only its subshell
+        assert sh.run("echo x; exit 3", 5) == (3, "x\n")
+        assert sh.run("printf 'no newline'", 5) == (0, "no newline")
+    finally:
+        sh.close()
+
+
+def test_host_shell_timeout_then_recovers():
+    sh = remote.HostShell(["sh"])
+    try:
+        assert sh.run("sleep 5", 0.3) == (None, remote.TIMEOUT)
+        assert sh.run("echo again", 5) == (0, "again\n")  # a fresh shell
+    finally:
+        sh.close()
+
+
+def test_host_shell_reconnects_once_after_a_drop():
+    sh = remote.HostShell(["sh"])
+    try:
+        assert sh.run("true", 5)[0] == 0
+        sh._proc.kill()  # the link dropped while idle
+        sh._proc.wait()
+        assert sh.run("echo back", 5) == (0, "back\n")
+    finally:
+        sh.close()
+
+
+def test_host_shell_unreachable_host():
+    sh = remote.HostShell(["sh", "-c", "exit 255"])  # like ssh refusing a login
+    assert sh.run("echo hi", 5) == (None, "")
+
+
+def test_remote_prints_scripts_without_running_them():
+    def script(*args):
+        return subprocess.run(
+            ["bash", app.ENGINE, "__remote", *args], capture_output=True, text=True
+        )
+
+    assert "tmux list-sessions" in script("probe").stdout
+    awake = script("awake").stdout
+    assert "__ON__" in awake and "__OFF__" in awake
+    assert script("peek", "my s").stdout.startswith("tmux capture-pane -p -e -t 'my s'")
+    assert "BatchMode=yes" in script("sshopts").stdout.split()
+    assert script("bogus").returncode != 0
+
+
+@contextlib.contextmanager
+def fake_shell(result, me="me"):
+    """Route remote calls to a canned shell result, as if hosts != `me`."""
+    calls = []
+
+    class Shell:
+        def run(self, script, timeout):
+            calls.append(script)
+            return result
+
+    orig_pool, orig_script = app._pool, app._script
+    app._pool = lambda: SimpleNamespace(get=lambda h, lg: Shell())
+    app._script = lambda kind, *a: f"<{kind}{''.join(' ' + x for x in a)}>"
+    app._ENV["TUIMUX_SELF_HOST"] = me
+    try:
+        yield calls
+    finally:
+        app._pool, app._script = orig_pool, orig_script
+        app._ENV.pop("TUIMUX_SELF_HOST", None)
+
+
+def test_probe_over_persistent_shell():
+    body = CANNED.split("\n", 1)[1]
+    with fake_shell((0, body)) as calls:
+        info = app.probe("remote-box", "u")
+    assert calls == ["<probe>"]
+    assert info["reachable"] and [s["auto"] for s in info["sessions"]] == ["cl", "main"]
+    with fake_shell((None, remote.TIMEOUT)):
+        assert app.probe("remote-box", "u")["busy"] is True
+    with fake_shell((None, "")):
+        info = app.probe("remote-box", "u")
+    assert not info["reachable"] and not info["busy"]
+
+
+def test_actions_use_the_shell_remotely_and_the_engine_locally():
+    with fake_shell((0, "")) as calls, stub_engine("") as _:
+        app.host_action("rename", "remote-box", "u", "old", "new")
+        assert calls == ["<rename old new>"]
+        app.host_action("kill", "me", "u", "s")  # the local host: engine path
+        assert calls == ["<rename old new>"]
+
+
+def test_reprobe_targets_one_host_and_skips_in_flight():
+    t = app.Tuimux()
+    hosts = [
+        ("a", False, "online", "", "compute", "o", "", True, "", "u", True),
+        ("b", False, "online", "", "compute", "o", "", True, "", "u", True),
+    ]
+    t._hosts = hosts
+    probed = []
+    t._probe_one = lambda h, key: probed.append(key)
+    t._reprobe("b", "u")
+    assert probed == [("b", "u")]
+    t._reprobe("b", "u")  # already in flight
+    assert probed == [("b", "u")]
+
+
+def test_pool_reuses_shells_and_stops_after_close():
+    pool = remote.ShellPool(lambda h, lg: ["sh"])
+    a = pool.get("h", "u")
+    assert pool.get("h", "u") is a  # one shell per (host, login)
+    assert a.run("echo 1", 5) == (0, "1\n")
+    pool.close_all()
+    # a probe still in flight at exit gets a dead shell, not a new connection
+    assert pool.get("h", "u").run("echo 1", 5) == (None, "")
+    assert a.run("echo 1", 5) == (None, "")  # nor can a shell handed out before
+
+
+# ---- latency hiding: optimistic actions, snapshot, preview cache ---------------
+_BOX = ("box", False, "online", "", "compute", "o", "", True, "", "u", True)
+_ME = ("me", True, "online", "", "compute", "o", "", True, "", "u", True)
+
+
+def _live(name, created="100"):
+    return {
+        "name": name,
+        "auto": name,
+        "attached": False,
+        "nclients": 0,
+        "dir": "~",
+        "tabs": "zsh",
+        "state": "idle",
+        "uptime": "1m",
+        "created": created,
+        "agent": False,
+    }
+
+
+def _app_with(sessions, **info):
+    a = app.Tuimux()
+    a._hosts = [_ME, _BOX]
+    a._results = {
+        ("box", "u"): {"reachable": True, "awake": False, "sessions": sessions, **info}
+    }
+    return a
+
+
+def _row_named(rows, name):
+    return next(cells for cells, m in rows if m.get("session") == name)
+
+
+def test_pending_action_shows_at_once_and_rename_shows_new_name():
+    a = _app_with([_live("old"), _live("other")])
+    a._request_render = lambda: None
+    a._act_worker = lambda *args: None
+    a._act("rename", "box", "u", "old", "new")
+    a._act("kill", "box", "u", "other")
+    rows = a._view()
+    old = _row_named(rows, "old")
+    assert "new" in _cell_text(old[0]) and _cell_text(old[2]) == "renaming…"
+    assert _cell_text(_row_named(rows, "other")[2]) == "closing…"
+
+
+def test_only_a_probe_started_after_the_action_clears_it():
+    a = _app_with([_live("s")])
+    a._request_render = lambda: None
+    a._act_worker = lambda *args: None
+    before = app.time.monotonic()
+    a._act("detach", "box", "u", "s")
+    info = {"reachable": True, "awake": False, "sessions": [_live("s")]}
+    a._got(("box", "u"), info, started=before)  # older, in-flight probe
+    assert _cell_text(_row_named(a._view(), "s")[2]) == "detaching…"
+    a._got(("box", "u"), info, started=app.time.monotonic())
+    assert _cell_text(_row_named(a._view(), "s")[2]) == "idle"
+
+
+def test_stale_snapshot_rows_are_dim_but_actionable():
+    a = _app_with([_live("s")], stale=True)
+    rows = a._view()
+    machine = next(cells for cells, m in rows if m.get("host") == "box")
+    assert _cell_text(machine[1]) == "checking…"
+    cells, meta = next((c, m) for c, m in rows if m.get("session") == "s")
+    assert meta["action"] == "attach"  # Enter works before the probe lands
+    assert "dim" in _cell_styles(cells[0])
+
+
+def test_snapshot_round_trip_and_corrupt_file():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "sub", "snapshot.json")
+        snap = {("box", "u"): [_live("s", created="0")]}
+        app.save_snapshot(path, [_ME, _BOX], snap)
+        hosts, got = app.load_snapshot(path)
+        assert hosts == [_ME, _BOX]
+        assert [x["name"] for x in got[("box", "u")]] == ["s"]
+        assert got[("box", "u")][0]["uptime"].endswith("d")  # recomputed
+        with open(path, "w") as f:
+            f.write("{not json")
+        assert app.load_snapshot(path) == ([], {})
+        assert app.load_snapshot(os.path.join(d, "missing.json")) == ([], {})
+
+
+def test_preview_cache_paints_on_return_and_prunes_closed_sessions():
+    a = _app_with([_live("s")])
+    painted = []
+    a._paint_preview = painted.append
+    a._request_render = lambda: None
+    a._preview_key = ("box", "u", "s")
+    a._show_preview(("box", "u", "s"), "hello")
+    assert painted == ["hello"] and a._peek_cache[("box", "u", "s")] == "hello"
+    a._show_preview(("box", "u", "gone"), "x")  # cursor moved on: cache only
+    assert painted == ["hello"]
+    a._got(("box", "u"), {"reachable": True, "awake": False, "sessions": [_live("s")]})
+    assert ("box", "u", "gone") not in a._peek_cache
+
+
+def test_open_skips_the_focus_walk_when_not_open():
+    a = app.Tuimux()
+    spawned = []
+    a._spawn = spawned.append
+    a._after_open = lambda: None
+    for is_open in (False, True):
+        meta = {"host": "box", "login": "u", "session": "s", "action": "attach"}
+        a._cur = lambda m={**meta, "open": is_open}: m
+        a.action_open()
+    assert [args[1] for args in spawned] == ["tab", "auto"]

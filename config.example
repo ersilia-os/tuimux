@@ -23,6 +23,11 @@
 # Per-host SSH connect timeout (seconds).
 # TUIMUX_SSH_TIMEOUT=5
 
+# The dashboard keeps one SSH connection open per remote host and reuses it for
+# probes, previews and actions, paying Tailscale SSH's ~2s handshake only once.
+# "off" opens a fresh connection per call (slower; a fallback if a host misbehaves).
+# TUIMUX_PERSIST=on
+
 # When a remote tab's connection drops (laptop slept, network changed), wait for
 # the host and re-attach the same session in place. If the session was closed on
 # the remote meanwhile, the tab says so and closes. "off" restores the old
@@ -75,6 +80,11 @@
 
 # How long the terminal window/tab scan (used for the "OPEN IN" column) may run.
 # TUIMUX_WINDOWS_TIMEOUT=5
+
+# How often (seconds) that scan runs in the background. It also runs when you
+# return to the dashboard and right after opening/detaching/closing a session.
+# Kept slow because on Ghostty each scan briefly stalls Ghostty's own drawing.
+# TUIMUX_WINDOWS_EVERY=15
 
 # How long the live pane preview capture (bottom panel) may run.
 # TUIMUX_PEEK_TIMEOUT=6
