@@ -1,7 +1,7 @@
 # A TUI for Ersilia's Tailnet
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 
 A terminal dashboard to see, open, and keep awake `tmux` sessions across every
 machine on Ersilia's [Tailscale](https://tailscale.com) tailnet — over Tailscale SSH, from
@@ -14,7 +14,7 @@ it helps others too.
 ## Requirements
 
 - `tmux` (required — tuimux is a front-end for it), plus `ssh`, `tailscale`, and a terminal.
-- Python ≥ 3.9.
+- Python ≥ 3.11.
 
 ## Install
 
@@ -35,7 +35,38 @@ tuimux devices                      # list every device in the tailnet
 tuimux doctor                       # check your setup
 ```
 
-Open, rename, detach, close, and keep-awake all happen inside the dashboard. The footer lists the keys, and a live preview of the highlighted session shows under the table.
+Open, rename, detach, close, and keep-awake all happen inside the dashboard. The footer lists the keys, and a live preview of the highlighted session shows under the table (`v` switches it to routines, or hides it).
+
+## Routines
+
+Claude prompts you run on a schedule, each on one fixed computer. When one is due, tuimux starts a `routine-<name>` session there with `claude` already working on the prompt, and it waits for you to join. The dashboard is the scheduler: routines start while it's open, and anything missed starts once when you next open it.
+
+`v` switches the bottom panel between the preview, your routines and nothing. In routines:
+
+| Key | |
+|---|---|
+| `enter` | run it now |
+| `n` / `e` / `c` / `x` | add / edit / duplicate / delete (`ctrl+o` in the form opens the prompt in `$EDITOR`) |
+| `space` | pause or resume |
+| `d` | mark the current run done (closes its session; closing it yourself counts too) |
+
+Anything that needs you blinks, and a badge on the sessions box says so from any view. When the work looks finished, Claude asks “Done with <name>?”; yes notes a one-line outcome and closes the run (`ask_done = false` skips it). RUNS shows the last eight runs; the card under the table shows what the last one produced.
+
+They live in `~/.config/tuimux/routines.toml`:
+
+```toml
+[[routine]]
+name = "lit-digest"
+host = "miquel-macmini"
+login = ""
+folder = "~/Documents/GitHub/ersilia-skills"
+schedule = "weekly mon 09:00"   # daily 09:00 · weekdays 09:00 · monthly 1 09:00 · every 6h
+enabled = true
+ask_done = true
+prompt = """
+/literature-digest
+"""
+```
 
 ## Setup conventions
 

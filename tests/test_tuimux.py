@@ -16,7 +16,12 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from tuimux import app  # noqa: E402
+from tuimux import app, routines  # noqa: E402
+
+# Never touch the real routines registry or run state from a test.
+_RT = tempfile.mkdtemp(prefix="tuimux-routines-test-")
+routines.REGISTRY = os.path.join(_RT, "routines.toml")
+routines.STATE = os.path.join(_RT, "routines.json")
 from tuimux.cli import tuimux_bin  # noqa: E402
 
 # Hermetic env: tuimux exports several TUIMUX_* vars into the shells it spawns (e.g.
@@ -2134,15 +2139,18 @@ def test_snapshot_round_trip_and_corrupt_file():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "sub", "snapshot.json")
         snap = {("box", "u"): [_live("s", created="0")]}
-        app.save_snapshot(path, [_ME, _BOX], snap)
-        hosts, got = app.load_snapshot(path)
-        assert hosts == [_ME, _BOX]
+        app.save_snapshot(path, [_ME, _BOX], snap, "routines")
+        hosts, got, panel = app.load_snapshot(path)
+        assert hosts == [_ME, _BOX] and panel == "routines"
         assert [x["name"] for x in got[("box", "u")]] == ["s"]
         assert got[("box", "u")][0]["uptime"].endswith("d")  # recomputed
         with open(path, "w") as f:
             f.write("{not json")
-        assert app.load_snapshot(path) == ([], {})
-        assert app.load_snapshot(os.path.join(d, "missing.json")) == ([], {})
+        assert app.load_snapshot(path) == ([], {}, "preview")
+        assert app.load_snapshot(os.path.join(d, "missing.json")) == ([], {}, "preview")
+        # a snapshot from before the panel existed (or a bad value) opens in preview
+        app.save_snapshot(path, [_ME], {}, "bogus")
+        assert app.load_snapshot(path)[2] == "preview"
 
 
 def test_preview_cache_paints_on_return_and_prunes_closed_sessions():
@@ -2169,3 +2177,465 @@ def test_open_skips_the_focus_walk_when_not_open():
         a._cur = lambda m={**meta, "open": is_open}: m
         a.action_open()
     assert [args[1] for args in spawned] == ["tab", "auto"]
+
+
+# ---- routines -----------------------------------------------------------------
+from datetime import datetime  # noqa: E402
+
+
+def test_schedule_phrases_and_slots():
+    now = datetime(2026, 2, 10, 12, 0)  # a Tuesday
+    weekly = routines.parse("weekly mon,thu 09:00")
+    assert routines.last_slot(weekly, now) == datetime(2026, 2, 9, 9, 0)
+    assert routines.next_slot(weekly, now, 0) == datetime(2026, 2, 12, 9, 0)
+    monthly = routines.parse("monthly 31 08:00")  # clamps to the month's last day
+    assert routines.last_slot(monthly, now) == datetime(2026, 1, 31, 8, 0)
+    assert routines.next_slot(monthly, now, 0) == datetime(2026, 2, 28, 8, 0)
+    jan1 = datetime(2026, 1, 1, 7, 0)  # before the slot: falls back into last year
+    assert routines.last_slot(monthly, jan1) == datetime(2025, 12, 31, 8, 0)
+    weekdays = routines.parse("weekdays 07:30")
+    sunday = datetime(2026, 2, 15, 10, 0)
+    assert routines.last_slot(weekdays, sunday) == datetime(2026, 2, 13, 7, 30)
+    every = routines.parse("every 6h")
+    assert routines.next_slot(every, now, now.timestamp()) == datetime(2026, 2, 10, 18)
+    for bad in ("", "weekly 09:00", "daily 25:00", "monthly 0 09:00", "every 0h"):
+        try:
+            routines.parse(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad!r} should not parse")
+
+
+def test_due_fires_once_and_not_at_creation():
+    daily = routines.parse("daily 09:00")
+    at = lambda *a: datetime(2026, 2, *a).timestamp()  # noqa: E731
+    created = at(10, 14, 0)  # added at 14:00, after today's slot
+    assert not routines.is_due(daily, created, at(10, 18, 0))
+    assert routines.is_due(daily, created, at(11, 9, 1))
+    # away for three days: one run owed, not three; after it, nothing until the next
+    assert routines.is_due(daily, created, at(14, 12, 0))
+    assert not routines.is_due(daily, at(14, 12, 0), at(14, 20, 0))
+    every = routines.parse("every 2d")
+    assert not routines.is_due(every, created, created + 86400)
+    assert routines.is_due(every, created, created + 2 * 86400)
+
+
+def test_registry_round_trip_keeps_awkward_prompts():
+    prompt = '/lit "q" """ triple \\ back\n\tline $HOME `x` \x01'
+    rs = [
+        {
+            "name": "lit",
+            "host": "h",
+            "login": "",
+            "folder": "~/a b",
+            "schedule": "daily 09:00",
+            "enabled": False,
+            "ask_done": False,
+            "prompt": prompt,
+        }
+    ]
+    routines.save_registry(rs)
+    assert routines.load_registry() == rs
+    # a routine written before ask_done existed asks by default
+    with open(routines.REGISTRY, "w") as f:
+        f.write('[[routine]]\nname = "old"\nprompt = "/x"\n')
+    assert routines.load_registry()[0]["ask_done"] is True
+    # a state file from before opened/done existed still loads
+    routines.save_state({"lit": {"since": 1.0, "last": None}})
+    entry = {"since": 1.0, "last": None, "opened": False, "done": None, "runs": []}
+    assert routines.load_state() == {"lit": entry}
+
+
+def test_launch_script_types_claude_and_keeps_the_prompt_exact():
+    prompt = "/test \"q\" 'single' $HOME `x` \\back\nline2"
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "tmux.log")
+        fake = os.path.join(d, "tmux")
+        with open(fake, "w") as f:  # has-session: no such session; log the rest
+            f.write(
+                f'#!/bin/sh\n[ "$1" = has-session ] && exit 1\necho "$@" >> {log}\n'
+            )
+        os.chmod(fake, 0o755)
+        script = subprocess.run(
+            ["bash", app.ENGINE, "__remote", "launch", "routine-t", "~", "t", "h", "u"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+        ).stdout
+        env = {**os.environ, "HOME": d, "PATH": f"{d}:{os.environ['PATH']}"}
+        out = subprocess.run(
+            ["sh", "-c", script], env=env, capture_output=True, text=True
+        )
+        assert out.stdout.strip() == "__LAUNCHED__"
+        with open(os.path.join(d, ".cache/tuimux/routines/t.prompt")) as f:
+            assert f.read() == prompt + "\n"  # $(cat …) drops the final newline
+        calls = open(log).read()
+        assert f"new -d -s routine-t -c {d}" in calls
+        assert "send-keys -t =routine-t: -l claude" in calls
+        assert "send-keys -t =routine-t: Enter" in calls
+        # a prompt that can't be written (e.g. a full disk) starts nothing
+        rdir = os.path.join(d, ".cache/tuimux/routines")
+        os.remove(os.path.join(rdir, "t.prompt"))
+        os.chmod(rdir, 0o500)
+        open(log, "w").close()
+        out = subprocess.run(
+            ["sh", "-c", script], env=env, capture_output=True, text=True
+        )
+        assert out.stdout.startswith("__FAIL__ couldn't write the prompt")
+        assert "new -d" not in open(log).read()
+        os.chmod(rdir, 0o700)
+
+
+def _routine(**kw):
+    return {
+        "name": "lit",
+        "host": "box",
+        "login": "",
+        "folder": "~",
+        "schedule": "daily 09:00",
+        "enabled": True,
+        "prompt": "/lit",
+        **kw,
+    }
+
+
+def _routine_app(sessions=None, reachable=True, stale=False, since=0.0):
+    a = app.Tuimux()
+    a._hosts = [_ME, _BOX]
+    a._routines = [_routine()]
+    a._rstate = {"lit": {"since": since, "last": None}}
+    if sessions is not None or not reachable:
+        a._results = {
+            ("box", "u"): {
+                "reachable": reachable,
+                "stale": stale,
+                "awake": False,
+                "sessions": sessions or [],
+            }
+        }
+    return a
+
+
+def _status(a):
+    return _cell_text(a._routine_row(a._routines[0], app.time.time())[-1])
+
+
+def test_routine_status_lifecycle():
+    agent = lambda st: {**_live("routine-lit"), "agent": True, "state": st}  # noqa: E731
+    base = dict(
+        sched_ok=True, enabled=True, sess=None, due=False, live=True, probed=True
+    )
+    cases = [
+        ({}, ("○", "scheduled", False)),
+        ({"due": True}, ("●", "starting…", False)),
+        (
+            {"due": True, "live": False, "probed": False},
+            ("◌", "due · checking…", False),
+        ),
+        ({"due": True, "live": False}, ("◌", "due · offline", True)),
+        ({"failed": True}, ("✕", "start failed", True)),
+        ({"sess": agent("idle")}, ("●", "ready", True)),  # started, not joined yet
+        ({"sess": agent("idle"), "opened": True}, ("●", "not done", False)),
+        ({"sess": agent("waiting"), "opened": True}, ("●", "waiting", True)),
+        ({"sess": agent("running")}, ("●", "running", False)),
+        ({"sess": _live("routine-lit")}, ("✕", "shell only", True)),
+        ({"sess": agent("idle"), "opened": True, "due": True}, ("●", "overdue", True)),
+        ({"done": True}, ("✓", "done", False)),
+        ({"enabled": False}, ("⏸", "paused", False)),
+        ({"sched_ok": False}, ("✕", "bad schedule", False)),
+    ]
+    for kw, (dot, word, pending) in cases:
+        got = app._routine_status(**{**base, **kw})
+        assert (got[0], got[1], got[3]) == (dot, word, pending), (kw, got)
+
+
+def test_routine_row_blinks_only_when_pending_and_uses_the_machine_accent():
+    a = _routine_app(reachable=False)  # due, computer offline: pending
+    hosts = [h[:8] + ("#ff9e64",) + h[9:] for h in a._hosts]
+    a._hosts = hosts
+    cells = a._routine_row(a._routines[0], app.time.time())
+    assert "blink" in _cell_styles(cells[-1]) and "#ff9e64" in _cell_styles(cells[1])
+    calm = _routine_app(sessions=[], since=app.time.time())  # just scheduled
+    assert "blink" not in _cell_styles(calm._routine_row(calm._routines[0], 0)[-1])
+
+
+def test_probe_marks_a_run_joined_then_done():
+    a = _routine_app(sessions=[])
+    a._save_state = lambda: None
+    a._rstate["lit"].update(last=100.0, opened=False, done=None)
+    joined = {**_live("routine-lit"), "attached": True}
+    a._track_routine_runs(("box", "u"), {"sessions": [joined]}, wall=200.0)
+    assert a._rstate["lit"]["opened"] is True
+    # the session went away after the run started: that run is done
+    a._track_routine_runs(("box", "u"), {"sessions": []}, wall=300.0)
+    assert a._rstate["lit"]["done"] == 300.0
+    # a probe from before the run started proves nothing
+    a._rstate["lit"].update(last=500.0, done=None)
+    a._track_routine_runs(("box", "u"), {"sessions": []}, wall=400.0)
+    assert a._rstate["lit"]["done"] is None
+
+
+def test_mark_done_closes_the_session_and_records_it():
+    a = _routine_app(sessions=[{**_live("routine-lit"), "agent": True}])
+    a._save_state = lambda: None
+    a._rstate["lit"].update(last=100.0)
+    a._cur_routine = lambda: a._routines[0]
+    killed, screens = [], []
+    a._act = lambda *args: killed.append(args)
+    a.push_screen = lambda screen, cb: screens.append(cb)
+    a.action_routine_done()
+    screens[0](True)  # confirm
+    assert killed == [("kill", "box", "u", "routine-lit")]
+    assert a._rstate["lit"]["done"]
+
+
+def test_badge_counts_pending_outside_the_routines_view():
+    a = _routine_app(reachable=False)  # one pending routine
+    wrap = SimpleNamespace(border_subtitle="")
+    a.query_one = lambda sel, *_: wrap
+    a._status_note = "autostart: on"
+    a._refresh_badge()
+    assert "1 routine needs you" in wrap.border_subtitle
+    assert wrap.border_subtitle.endswith("autostart: on")
+    a._panel = "routines"
+    a._refresh_badge()
+    assert wrap.border_subtitle == "autostart: on"
+
+
+def _ticked(a):
+    a._table = object()  # mounted enough for the tick
+    a._modal_open = lambda: False
+    a._request_render = lambda: None
+    a._registry_mtime = lambda: a._routines_mtime
+    started = []
+    a._launch = lambda r, login, open_after: started.append((r["name"], login))
+    a._tick_routines()
+    return started
+
+
+def test_tick_starts_only_due_routines_on_a_live_computer_without_a_session():
+    assert _ticked(_routine_app(sessions=[])) == [("lit", "u")]
+    assert _ticked(_routine_app(reachable=False)) == []
+    assert _ticked(_routine_app(sessions=[], stale=True)) == []  # snapshot only
+    assert _ticked(_routine_app(sessions=[_live("routine-lit")])) == []  # one at a time
+    assert _ticked(_routine_app(sessions=[], since=app.time.time())) == []  # not due
+    a = _routine_app(sessions=[])
+    a._launching.add("lit")  # already being started
+    assert _ticked(a) == []
+
+
+def test_failed_start_backs_off_and_warns_once():
+    a = _routine_app(sessions=[])
+    toasts = []
+    a.notify = lambda msg, **kw: toasts.append(msg)
+    a._request_render = lambda: None
+    r = a._routines[0]
+    a._launched(r, "u", "__FAIL__ couldn't write the prompt file (disk full?)\n", False)
+    assert _status(a) == "start failed"
+    assert _ticked(a) == []  # no retry on the next probe
+    a._launched(r, "u", "__FAIL__ couldn't write the prompt file (disk full?)\n", False)
+    assert len(toasts) == 1 and "disk full" in toasts[0]
+    a._failed["lit"] = (app.time.monotonic() - app.ROUTINE_RETRY - 1, "x")
+    assert _ticked(a) == [("lit", "u")]  # retried once the backoff has passed
+
+
+def test_old_python_gets_a_plain_message_not_a_traceback():
+    from tuimux import cli
+
+    cli._require_python((3, 11, 0))  # new enough: no-op
+    try:
+        cli._require_python((3, 10, 14))
+    except SystemExit as e:
+        assert "needs Python 3.11 or newer" in str(e) and "3.10" in str(e)
+    else:
+        raise AssertionError("3.10 should exit with a message")
+
+
+def test_v_cycles_the_bottom_panel_and_remembers_it():
+    a = app.Tuimux()
+    a._preview = SimpleNamespace(display=True)
+    wrap = SimpleNamespace(display=False)
+    a.query_one = lambda sel, *_: wrap
+    focused = []
+    a._table = SimpleNamespace(focus=lambda: focused.append("sessions"))
+    a._rtable = SimpleNamespace(focus=lambda: focused.append("routines"))
+    a._sync_routine_detail = lambda: None
+    a._sync_preview_target = lambda: None
+    saved = []
+    orig = app.save_snapshot
+    app.save_snapshot = lambda path, hosts, snap, panel: saved.append(panel)
+    try:
+        seen = []
+        for _ in range(3):
+            a.action_panel()
+            seen.append((a._panel, a._preview.display, wrap.display, focused[-1]))
+    finally:
+        app.save_snapshot = orig
+    assert seen == [
+        ("routines", False, True, "routines"),  # routines: cursor goes into it
+        ("none", False, False, "sessions"),  # none: sessions get the full height
+        ("preview", True, False, "sessions"),
+    ]
+    assert saved == ["routines", "none", "preview"]
+    assert a._preview_on  # captures run only while the preview is shown
+
+
+def test_routine_detail_card():
+    r = _routine(folder="~/repo", enabled=False, prompt="/lit\nmore")
+    entry = routines.new_entry(0)
+    first, second, third = app._routine_detail(r, entry, now=1000).plain.split("\n")
+    assert first == "Daily · 09:00  ·  ~/repo  ·  asks when finished  ·  paused"
+    assert second == "/lit  ↵  more"  # the prompt on one line
+    assert third == "not run yet"
+    routines.add_run(entry, 0)
+    entry["runs"][-1].update(done=1500.0, outcome="12 new papers")
+    third = app._routine_detail(r, entry, now=1500 + 7200).plain.split("\n")[2]
+    assert third == "last outcome: 12 new papers  ·  2h ago  ·  took 25m"
+    failed = app._routine_detail(r, entry, "disk full").plain.split("\n")[2]
+    assert failed == "last start failed: disk full"
+
+
+def test_routines_panel_summary():
+    assert app._routine_summary(0, 0) == ""
+    assert app._routine_summary(1, 0) == "1 routine"
+    assert app._routine_summary(8, 4).startswith("8 routines  ·  ")
+    assert "4 need you" in app._routine_summary(8, 4)
+    assert "1 needs you" in app._routine_summary(3, 1)
+
+
+def test_routine_on_a_computer_tailscale_reports_offline_is_offline_not_checking():
+    a = _routine_app()  # no probe result for "box"
+    a._hosts = [
+        _ME,
+        ("box", False, "offline", "2h ago", "compute", "o", "", False, "", "u", True),
+    ]
+    assert _status(a) == "due · offline"
+    a._hosts = [_ME]  # not in the tailnet at all
+    assert _status(a) == "due · offline"
+    a._hosts = []  # before discovery: still checking
+    assert _status(a) == "due · checking…"
+
+
+def test_ask_done_hands_claude_the_finish_instruction_separately():
+    def script(ask):
+        return subprocess.run(
+            [
+                "bash",
+                app.ENGINE,
+                "__remote",
+                "launch",
+                "routine-t",
+                "~",
+                "t",
+                "h",
+                "u",
+                ask,
+            ],
+            input="/literature-digest",
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    asking = script("1")
+    # the instruction goes in through --append-system-prompt, the prompt untouched
+    typed = next(ln for ln in asking.splitlines() if " -l " in ln)
+    assert "claude --append-system-prompt" in typed and "t.prompt" in typed
+    assert '"Done with t?"' in asking
+    assert "tmux kill-session -t '=routine-t'" in asking
+    plain = script("0")
+    assert "--append-system-prompt" not in plain and "Done with" not in plain
+
+
+def test_describe_reads_like_people_talk():
+    cases = {
+        "weekly mon 08:00": "Mondays · 08:00",
+        "weekly mon,thu 08:00": "Mon & Thu · 08:00",
+        "weekdays 08:30": "Weekdays · 08:30",
+        "daily 07:00": "Daily · 07:00",
+        "monthly 1 09:00": "Monthly · 1st · 09:00",
+        "monthly 22 09:00": "Monthly · 22nd · 09:00",
+        "every 6h": "Every 6 hours",
+        "every 1d": "Every day",
+        "nonsense": "nonsense",
+    }
+    for phrase, said in cases.items():
+        assert routines.describe(phrase) == said
+
+
+def test_run_history_records_starts_failures_lateness_and_caps():
+    entry = routines.new_entry(0)
+    for i in range(10):
+        routines.add_run(entry, float(i))
+    assert len(entry["runs"]) == routines.HISTORY  # oldest dropped
+    assert entry["runs"][0]["start"] == 2.0
+    routines.add_run(entry, 20.0, failed=True)
+    assert routines.current_run(entry)["start"] == 9.0  # a failed start isn't a run
+    entry["runs"][-2].update(done=10.0, late=True)
+    strip = app._runs_strip(entry)
+    assert strip[-2] == ("✓", app.AMBER) and strip[-1] == ("✕", app.RED)
+    assert app._runs_strip(routines.new_entry(0)) == (("·", "dim"),)
+
+
+def test_done_run_fetches_and_keeps_its_outcome():
+    a = _routine_app(sessions=[])
+    a._save_state = lambda: None
+    a._request_render = lambda: None
+    entry = a._rstate["lit"]
+    entry["last"] = 100.0
+    routines.add_run(entry, 100.0)
+    fetched = []
+    a._fetch_outcome = lambda r, login, start: fetched.append(start)
+    a._track_routine_runs(("box", "u"), {"sessions": []}, wall=200.0)
+    assert entry["runs"][-1]["done"] == 200.0 and fetched == [100.0]
+    a._got_outcome("lit", 100.0, "3 flagged")
+    assert entry["runs"][-1]["outcome"] == "3 flagged"
+
+
+def test_engine_outcome_and_claude_check_scripts():
+    def engine(*args, inp=""):
+        return subprocess.run(
+            ["bash", app.ENGINE, *args], input=inp, capture_output=True, text=True
+        ).stdout
+
+    launch = engine(
+        "__remote", "launch", "routine-t", "~", "t", "h", "u", "1", inp="/x"
+    )
+    assert 'rm -f "$HOME/.cache/tuimux/routines/t.outcome"' in launch
+    assert "t.outcome" in launch.split("TUIMUX_DONE_TEXT")[1]  # claude is told where
+    with tempfile.TemporaryDirectory() as d:
+        env = {**os.environ, "HOME": d, "PATH": "/usr/bin:/bin"}
+        os.makedirs(os.path.join(d, ".cache/tuimux/routines"))
+        with open(os.path.join(d, ".cache/tuimux/routines/t.outcome"), "w") as f:
+            f.write("12 new papers\n")
+        sh = lambda script: subprocess.run(  # noqa: E731
+            ["sh", "-c", script], env=env, capture_output=True, text=True
+        ).stdout.strip()
+        assert sh(engine("__remote", "outcome", "t")) == "12 new papers"
+        check = engine("__remote", "claude_check")
+        assert sh(check) == "__NONE__"
+        os.makedirs(os.path.join(d, ".local/bin"))
+        claude = os.path.join(d, ".local/bin/claude")
+        with open(claude, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(claude, 0o755)
+        assert sh(check) == claude
+
+
+def test_duplicate_opens_a_paused_copy():
+    a = _routine_app(sessions=[])
+    a._cur_routine = lambda: a._routines[0]
+    a._compute_hosts = lambda also="": ["box"]
+    screens = []
+    a.push_screen = lambda screen, cb: screens.append(screen)
+    a.action_routine_copy()
+    form = screens[0]
+    assert form.routine["name"] == "lit-copy" and form.routine["enabled"] is False
+
+
+def test_when_reads_naturally():
+    now = app.datetime(2026, 2, 10, 9, 0)
+    assert app._when(app.datetime(2026, 2, 10, 9, 40), now) == "in 40m"
+    assert app._when(app.datetime(2026, 2, 10, 12, 0), now) == "in 3h"
+    assert app._when(app.datetime(2026, 2, 10, 22, 0), now) == "today 22:00"
+    assert app._when(app.datetime(2026, 2, 11, 8, 0), now) == "tomorrow 08:00"
+    assert app._when(app.datetime(2026, 2, 13, 8, 0), now) == "Fri 08:00"

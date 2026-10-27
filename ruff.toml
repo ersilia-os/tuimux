@@ -1,0 +1,5 @@
+# The rules `ruff check` enforces, selected explicitly: ruff's long-standing
+# default set. Without this, a newer ruff with broader defaults would silently
+# change what "ruff check passes" means (ruff 0.17 flags 76 more findings).
+[lint]
+select = ["E4", "E7", "E9", "F"]

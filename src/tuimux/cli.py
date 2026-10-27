@@ -26,6 +26,21 @@ def _require_tmux() -> None:
     )
 
 
+def _require_python(version=sys.version_info) -> None:
+    """The dashboard needs Python 3.11+ (routines read TOML with `tomllib`).
+    Say so plainly instead of crashing on the import. Subcommands go straight
+    to the bash engine and keep working on older Pythons."""
+    if version >= (3, 11):
+        return
+    sys.exit(
+        f"tuimux: the dashboard needs Python 3.11 or newer "
+        f"(this is {version[0]}.{version[1]}: {sys.executable}).\n"
+        "Install tuimux into a newer Python, e.g.:\n"
+        "  conda create -n tuimux python=3.12 && conda activate tuimux\n"
+        "  pip install git+https://github.com/ersilia-os/tuimux"
+    )
+
+
 def _maybe_first_run() -> None:
     """On the very first run, let the engine enable the default features
     (autostart + mouse scroll). A marker file makes it a one-time thing; we check
@@ -67,6 +82,7 @@ def main() -> None:
     _require_tmux()  # nothing tuimux does makes sense without tmux
     _maybe_first_run()  # enable autostart + mouse scroll on the very first run
     if not args:
+        _require_python()  # before importing the dashboard, which needs 3.11
         from .app import run
 
         run()

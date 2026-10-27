@@ -429,7 +429,7 @@ tmux list-clients -F "L|#{client_session}|#{client_termname}" 2>/dev/null
   cap="$(tmux capture-pane -p -t "$pane" 2>/dev/null)"
   if printf "%s\n" "$cap" | grep -qi "esc to interrupt"; then
     echo "A|$s|running"
-  elif printf "%s\n" "$cap" | grep -qiE "Do you want|Would you like|❯[[:space:]]*[0-9]|\(y/n\)"; then
+  elif printf "%s\n" "$cap" | grep -qiE "Do you want|Would you like|Enter to confirm|❯[[:space:]]*[0-9]|\(y/n\)"; then
     echo "A|$s|waiting"
   else
     echo "A|$s|idle"
@@ -600,6 +600,10 @@ remote_script() {
     kill)   printf "tmux kill-session -t '%s' 2>/dev/null" "${1:-}" ;;
     rename) printf "tmux rename-session -t '%s' '%s'" "${1:-}" "${2:-}" ;;
     awake)  awake_toggle_script ;;
+    launch) launch_script "$@" ;;
+    # what the routine's claude wrote about its run (empty if nothing)
+    outcome) printf 'cat "$HOME/.cache/tuimux/routines/%s.outcome" 2>/dev/null; true' "${1:-}" ;;
+    claude_check) claude_check_script ;;
     # the ssh options, one per line, so the dashboard's shells honour the config
     sshopts) printf '%s\n' "${SSH_OPTS[@]}" ;;
     *)      return 1 ;;
@@ -1126,6 +1130,81 @@ open_surface() {
 }
 
 # ----- keep-awake ------------------------------------------------------------
+# Single-quote a string for any POSIX sh (no bash-only $'…' forms).
+sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Start a routine: a detached tmux session in <folder> on the host, with claude
+# typed into its normal interactive shell — so the user's rc files put claude on
+# PATH, exactly as when you open a session by hand. The prompt (read from stdin)
+# goes to a file first and claude reads it with $(cat …), so quotes, $ and
+# newlines in it survive untouched. Prints __LAUNCHED__, __EXISTS__, or
+# "__FAIL__ <reason>" — then nothing was started (e.g. the prompt couldn't be
+# written because the disk is full: claude must never start without it).
+# Args: <session> <folder> <name> <host> <login> [ask_done]; <name> is a slug.
+# With ask_done=1 claude also gets done_instruction (via --append-system-prompt,
+# so a skill prompt like "/literature-digest" stays exactly as written).
+launch_script() {
+  local session="$1" folder="$2" name="$3" host="$4" login="$5" ask="${6:-0}"
+  local prompt delim dir pfile dfile done_text="" write_done="" claude_cmd
+  prompt="$(cat)"
+  delim="TUIMUX_PROMPT_$RANDOM$RANDOM"
+  while printf '%s\n' "$prompt" | grep -qxF "$delim"; do delim="${delim}X"; done
+  case "$folder" in
+    ""|"~") dir='"$HOME"' ;;
+    "~/"*)  dir="\"\$HOME\"/$(sh_quote "${folder#\~/}")" ;;
+    *)      dir="$(sh_quote "$folder")" ;;
+  esac
+  pfile="\$HOME/.cache/tuimux/routines/$name.prompt"
+  claude_cmd="claude \"\$(cat \"$pfile\")\""
+  if [ "$ask" = 1 ]; then
+    dfile="\$HOME/.cache/tuimux/routines/$name.done.md"
+    done_text="$(done_instruction "$name" "$session")"
+    write_done="cat > \"$dfile\" <<'TUIMUX_DONE_TEXT' || { echo \"__FAIL__ couldn't write the prompt file (disk full?)\"; exit 0; }
+$done_text
+TUIMUX_DONE_TEXT"
+    claude_cmd="claude --append-system-prompt \"\$(cat \"$dfile\")\" \"\$(cat \"$pfile\")\""
+  fi
+  cat <<EOF
+if tmux has-session -t $(sh_quote "=$session") 2>/dev/null; then echo __EXISTS__; exit 0; fi
+rm -f "\$HOME/.cache/tuimux/routines/$name.outcome"  # a fresh run, a fresh outcome
+mkdir -p "\$HOME/.cache/tuimux/routines" && cat > "$pfile" <<'$delim' || { echo "__FAIL__ couldn't write the prompt file (disk full?)"; exit 0; }
+$prompt
+$delim
+$write_done
+dir=$dir; [ -d "\$dir" ] || dir="\$HOME"
+tmux new -d -s $(sh_quote "$session") -c "\$dir" || { echo "__FAIL__ tmux couldn't start the session"; exit 0; }
+$(tmux_opts)$(status_style "$host" "$login")
+tmux send-keys -t $(sh_quote "=$session:") -l '$claude_cmd'
+tmux send-keys -t $(sh_quote "=$session:") Enter
+echo __LAUNCHED__
+EOF
+}
+
+# Where claude lives on a host, found WITHOUT an interactive shell (that would
+# trip the autostart snippet): PATH first, then the usual install locations.
+# Prints the path, or __NONE__.
+claude_check_script() {
+  printf '%s' 'for c in "$(command -v claude 2>/dev/null)" "$HOME/.local/bin/claude" \
+  /opt/homebrew/bin/claude /usr/local/bin/claude "$HOME/.claude/local/claude" \
+  "$HOME/.npm-global/bin/claude" "$HOME"/.nvm/versions/node/*/bin/claude; do
+  [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; exit 0; }
+done
+echo __NONE__'
+}
+
+# What a routine's claude is told about finishing: ask, and on "yes" close its
+# own tmux session — which tuimux sees and records as the run being done.
+done_instruction() {
+  local name="$1" session="$2"
+  printf '%s\n' \
+    "This session is the tuimux routine \"$name\" (tmux session $session)." \
+    "When you believe the routine's work is finished, ask the user with your multiple-choice question tool: \"Done with $name?\" with the options \"Yes, close it\" and \"Not yet\"." \
+    "If they choose \"Yes, close it\", first write ONE short line saying what this run produced (e.g. \"12 new papers, 3 flagged for the Hub\") with: printf '%s\\n' \"<that line>\" > \"\$HOME/.cache/tuimux/routines/$name.outcome\"" \
+    "Then run exactly: tmux kill-session -t '=$session'" \
+    "That ends this session, and tuimux records the run as done, with your line as its outcome." \
+    "If they choose \"Not yet\", keep helping, and ask again the next time you believe the work is finished. Never ask before the work is done."
+}
+
 # Flip keep-awake in ONE remote round trip: if the keeper session exists, kill it;
 # otherwise start an OS-appropriate keeper inside it. Prints exactly one of
 # __OFF__ / __ON__ / __UNSUPPORTED__ / __FAIL__.
@@ -1633,6 +1712,10 @@ case "${1:-}" in
   __renameto    ) shift; rssh_as "${2:-}" "${1:-}" "$(remote_script rename "${3:-}" "${4:-}")" ;;
   # print (don't run) the remote script for a dashboard action: __remote <kind> [args]
   __remote      ) shift; remote_script "$@" ;;
+  # run a read-only remote_script on a host: __read <kind> <host> <login> [args]
+  __read        ) shift; k="${1:-}" h="${2:-}" l="${3:-}"; shift 3; rssh_as "$l" "$h" "$(remote_script "$k" "$@")" ;;
+  # start a routine (prompt on stdin): __launch <session> <folder> <name> <host> <login>
+  __launch      ) shift; rssh_as "${5:-}" "${4:-}" "$(launch_script "$@")" ;;
   __windows     ) list_windows ;;
   __selfwin     ) self_winid ;;
   __autoname    ) docker_name ;;

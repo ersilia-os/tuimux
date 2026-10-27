@@ -17,6 +17,9 @@
 # `tuimux login <host> <user[,user...]>` (--add / --rm to adjust one user).
 # TUIMUX_LOGINS="herbert=mduran splunk-server=mduranfrigola,gturon"
 
+# Routines (scheduled Claude prompts) live in their own file,
+# ~/.config/tuimux/routines.toml — see the README. They need no setting here.
+
 # Session name used when you create one without naming it.
 # TUIMUX_DEFAULT_SESSION="main"
 

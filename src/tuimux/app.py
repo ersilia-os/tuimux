@@ -10,24 +10,38 @@ import atexit
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from datetime import datetime
 from importlib.resources import files
 
 from rich.text import Text
 from textual import events, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
-from textual.widgets import Header, Footer, DataTable, Label, Input, OptionList, Static
+from textual.widgets import (
+    Checkbox,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    OptionList,
+    Select,
+    Static,
+    TextArea,
+)
 from textual.widgets.option_list import Option
 
-from . import remote
+from . import remote, routines
 from .cli import tuimux_bin
 
 ENGINE = str(files("tuimux").joinpath("engine.sh"))
@@ -62,6 +76,7 @@ VIOLET = "#b08cff"  # agent
 AMBER = "#e0af68"  # awake / waiting / no-ssh
 GREEN = "#9ece6a"  # active session / running / working
 MUTED = "#565f89"  # gray (offline status dot)
+RED = "#f7768e"  # a routine that failed / can't run
 
 
 def _marker(state):
@@ -128,6 +143,11 @@ WINDOWS_EVERY = float(os.environ.get("TUIMUX_WINDOWS_EVERY", "15") or 15)
 # Wait this long after the cursor stops before capturing a preview, so holding an
 # arrow key sends one capture instead of one per row passed.
 PEEK_DEBOUNCE = 0.12
+# After a routine fails to start (e.g. its computer's disk is full), wait this
+# long before the scheduler tries again — rather than on every probe.
+ROUTINE_RETRY = 300
+# What the bottom panel can show, in the order `v` cycles through them.
+PANELS = ("preview", "routines", "none")
 # Last-known hosts + sessions, saved on exit and shown (dimmed) at the next launch
 # while the real probes run, so the table is useful from the first frame.
 SNAPSHOT = os.path.expanduser("~/.cache/tuimux/snapshot.json")
@@ -140,7 +160,7 @@ _PENDING_LABEL = {
 }
 
 
-def _run(args, timeout=None):
+def _run(args, timeout=None, input=None):
     try:
         return subprocess.run(
             ["bash", ENGINE, *args],
@@ -148,6 +168,7 @@ def _run(args, timeout=None):
             text=True,
             env=_ENV,
             timeout=timeout,
+            input=input,
         )
     except subprocess.TimeoutExpired:
         # Distinct marker so callers can tell "too slow to answer" apart from a
@@ -209,6 +230,120 @@ def host_action(kind, host, login, *args):
         _shell(host, login, kind, *args, timeout=ACTION_TIMEOUT)
     else:
         _run([_ACTIONS[kind], host, login, *args], timeout=ACTION_TIMEOUT)
+
+
+def launch_routine(host, login, r):
+    """Start a routine's session on its host.
+
+    Parameters
+    ----------
+    host, login : str
+        Where to start it, and as whom.
+    r : dict
+        The routine (see `routines.load_registry`).
+
+    Returns
+    -------
+    str
+        The engine's output: contains ``__LAUNCHED__``, ``__EXISTS__`` or
+        ``__FAIL__``; anything else means the host couldn't be reached.
+    """
+    ask = "1" if r.get("ask_done", True) else "0"
+    args = [routines.session_name(r["name"]), r["folder"], r["name"], host, login, ask]
+    if not _persistent(host):
+        return _run(
+            ["__launch", *args], timeout=ACTION_TIMEOUT, input=r["prompt"]
+        ).stdout
+    script = _run(
+        ["__remote", "launch", *args], timeout=HOSTS_TIMEOUT, input=r["prompt"]
+    )
+    rc, out = _pool().get(host, login).run(script.stdout, ACTION_TIMEOUT)
+    return out if rc is not None else ""
+
+
+def _ago(secs):
+    """ "5m ago" / "3h ago" / "2d ago" for a duration in seconds."""
+    secs = max(int(secs), 0)
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def _when(t, now):
+    """When a future datetime is: "in 45m", "in 3h", "tomorrow 08:00",
+    "Mon 09:00" or "Nov 03"."""
+    secs = (t - now).total_seconds()
+    if secs < 3600:
+        return f"in {max(int(secs // 60), 1)}m"
+    if secs < 12 * 3600:
+        return f"in {int(secs // 3600)}h"
+    if t.date() == now.date():
+        return t.strftime("today %H:%M")
+    if (t.date() - now.date()).days == 1:
+        return t.strftime("tomorrow %H:%M")
+    if secs < 6 * 86400:
+        return t.strftime("%a %H:%M")
+    return t.strftime("%b %d")
+
+
+def host_read(kind, host, login, *args):
+    """Run a read-only remote script on a host and return its output.
+
+    Returns
+    -------
+    str or None
+        The script's stdout, or None if the host couldn't be reached.
+    """
+    if _persistent(host):
+        rc, out = _shell(host, login, kind, *args, timeout=ACTION_TIMEOUT)
+        return out if rc is not None else None
+    res = _run(["__read", kind, host, login, *args], timeout=ACTION_TIMEOUT)
+    return res.stdout if res.returncode == 0 else None
+
+
+def _took(secs):
+    """A run's length: "25m", "2h 10m", "3d"."""
+    m = max(int(secs) // 60, 1)
+    if m < 60:
+        return f"{m}m"
+    if m < 1440:
+        return f"{m // 60}h {m % 60}m" if m % 60 else f"{m // 60}h"
+    return f"{m // 1440}d"
+
+
+def edit_in_editor(app, text):
+    """Open `text` in $EDITOR (vi if unset), suspending the dashboard meanwhile.
+
+    Returns
+    -------
+    str or None
+        The edited text, or None if the editor couldn't run.
+    """
+    editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+    fd, path = tempfile.mkstemp(prefix="tuimux-prompt-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        with app.suspend():
+            rc = subprocess.run([*editor, path]).returncode
+        if rc != 0:
+            return None
+        with open(path) as f:
+            return f.read()
+    except SuspendNotSupported:
+        app.notify("can't open an editor from this terminal", severity="warning")
+        return None
+    except OSError:
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def peek(host, login, session):
@@ -461,11 +596,13 @@ def _probe_or_offline(h):
     return (h, probe(name, login))
 
 
-def save_snapshot(path, hosts, snap):
-    """Write the host list and last-known sessions per (host, login) to `path`."""
+def save_snapshot(path, hosts, snap, panel="preview"):
+    """Write the host list, last-known sessions per (host, login) and the bottom
+    panel's view to `path`."""
     data = {
         "hosts": [list(h) for h in hosts],
         "snap": {f"{h}\t{lg}": v for (h, lg), v in snap.items()},
+        "panel": panel,
     }
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -483,7 +620,8 @@ def load_snapshot(path):
     Returns
     -------
     tuple
-        ``(hosts, snap)``; empty if the file is missing or unreadable.
+        ``(hosts, snap, panel)``; empty (and ``"preview"``) if the file is
+        missing or unreadable.
     """
     try:
         with open(path) as f:
@@ -495,9 +633,126 @@ def load_snapshot(path):
             for x in sessions:  # uptime was frozen at save time; recompute it
                 x["uptime"] = _uptime(x.get("created", ""))
             snap[(host, login)] = sessions
-        return hosts, snap
+        panel = data.get("panel")
+        return hosts, snap, panel if panel in PANELS else "preview"
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return [], {}
+        return [], {}, "preview"
+
+
+def _routine_detail(r, entry=None, failed="", now=None):
+    """The card under the routines table: three quiet lines.
+
+    When and where it runs; the prompt on one line (long ones cut with "…");
+    and how its last run went — or why it couldn't start.
+    """
+    now = now or time.time()
+    entry = entry or {}
+    body = Text(no_wrap=True, overflow="ellipsis")
+    body.append(f"{routines.describe(r['schedule'])}  ·  {r['folder']}", "dim")
+    if r.get("ask_done", True):
+        body.append("  ·  asks when finished", "dim")
+    if not r["enabled"]:
+        body.append("  ·  paused", "dim")
+    body.append("\n")
+    body.append(
+        "  ↵  ".join(ln.strip() for ln in r["prompt"].splitlines() if ln.strip())
+    )
+    body.append("\n")
+    run = routines.current_run(entry)
+    if failed:
+        body.append(f"last start failed: {failed}", AMBER)
+    elif run is None:
+        body.append("not run yet", "dim italic")
+    elif run["done"] is None:
+        body.append(f"started {_ago(now - run['start'])}  ·  not done yet", "dim")
+    else:
+        what = run["outcome"] or "no outcome noted"
+        body.append("last outcome: ", "dim")
+        body.append(what, "" if run["outcome"] else "dim italic")
+        body.append(
+            f"  ·  {_ago(now - run['done'])}  ·  took {_took(run['done'] - run['start'])}",
+            "dim",
+        )
+    return body
+
+
+def _runs_strip(entry, live_color=""):
+    """One glyph per remembered run, oldest first: ✓ done (amber if it ran late),
+    ✕ couldn't start, ● still open (in its status colour); · when none yet."""
+    runs = entry.get("runs", []) if entry else []
+    if not runs:
+        return (("·", "dim"),)
+    out = []
+    for run in runs:
+        if run["failed"]:
+            out.append(("✕", RED))
+        elif run["done"] is not None:
+            out.append(("✓", AMBER if run["late"] else GREEN))
+        else:
+            out.append(("●", live_color))
+    return tuple(out)
+
+
+def _routine_summary(total, pending):
+    """The routines panel's border note: how many, and how many want you."""
+    if not total:
+        return ""
+    note = f"{total} routine{'' if total == 1 else 's'}"
+    if pending:
+        note += f"  ·  [bold {AMBER}]{pending} need{'s' if pending == 1 else ''} you[/]"
+    return note
+
+
+def _routine_status(
+    *,
+    sched_ok,
+    enabled,
+    sess,
+    due,
+    live,
+    probed,
+    failed=False,
+    launching=False,
+    opened=False,
+    done=False,
+    tick=0,
+):
+    """Where one routine's run stands.
+
+    Returns
+    -------
+    tuple
+        ``(dot, word, color, pending)``. `pending` means it wants you: it
+        blinks, and counts toward the badge shown outside the routines view.
+    """
+    if sess is not None:  # a run is open on its computer
+        if due:  # the next run is owed but this one was never finished
+            return ("●", "overdue", AMBER, True)
+        if not sess["agent"]:
+            return ("✕", "shell only", RED, True)  # claude didn't start in it
+        st = sess["state"]
+        if st == "waiting":
+            return ("●", "waiting", AMBER, True)
+        if st in ("running", "working"):
+            return ("●", "running" + "." * (tick % 4), GREEN, False)
+        if not opened:
+            return ("●", "ready", AMBER, True)  # finished its start, not joined yet
+        return ("●", "not done", "", False)
+    if not sched_ok:
+        return ("✕", "bad schedule", RED, False)
+    if not enabled:
+        return ("⏸", "paused", "dim", False)
+    if failed:
+        return ("✕", "start failed", RED, True)
+    if launching or (due and live):
+        return ("●", "starting…", GREEN, False)
+    if due:
+        if probed:
+            return ("◌", "due · offline", AMBER, True)
+        return ("◌", "due · checking…", "dim italic", False)
+    if done:
+        return ("✓", "done", GREEN, False)
+    return ("○", "scheduled", "dim", False)
 
 
 # Table columns in display order. A "cell" is a tuple of (text, style) segments
@@ -524,16 +779,17 @@ def _row(meta, **cells):
 class Confirm(ModalScreen[bool]):
     BINDINGS = [("escape", "no"), ("n", "no"), ("y", "yes")]
 
-    def __init__(self, message):
+    def __init__(self, message, ok_label="✕   yes, shut it down"):
         super().__init__()
         self.message = message
+        self.ok_label = ok_label
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(self.message, id="dialog-msg")
             yield OptionList(
                 Option("↩   cancel", id="cancel"),
-                Option("✕   yes, shut it down", id="ok"),
+                Option(self.ok_label, id="ok"),
                 id="menu-list",
             )
 
@@ -627,13 +883,199 @@ class SessionTable(DataTable):
     ]
 
 
+class RoutineForm(ModalScreen[dict]):
+    """Add or edit a routine. Dismisses with the routine dict, or None."""
+
+    BINDINGS = [
+        ("escape", "cancel", "cancel"),
+        ("ctrl+s", "save", "save"),
+        # ctrl+o: the text fields keep ctrl+e (end of line) for themselves
+        Binding("ctrl+o", "editor", "prompt in $EDITOR", priority=True),
+    ]
+
+    def __init__(self, routine, hosts, taken, title=None, check_claude=None):
+        super().__init__()
+        self.routine = routine
+        self.hosts = hosts
+        self.taken = taken  # names already used by other routines
+        self.title_text = title or (
+            "edit routine" if routine["name"] else "new routine"
+        )
+        # check_claude(host, callback) reports where claude lives on a computer
+        self.check_claude = check_claude
+
+    def compose(self) -> ComposeResult:
+        r = self.routine
+        host = r["host"] if r["host"] in self.hosts else self.hosts[0]
+        with Vertical(id="form"):
+            yield Label(self.title_text, id="form-title")
+            with Horizontal(classes="row"):
+                with Vertical(classes="col"):
+                    yield Label("name", classes="field")
+                    yield Input(r["name"], placeholder="e.g. lit-digest", id="f-name")
+                with Vertical(classes="col"):
+                    yield Label("computer", classes="field")
+                    yield Select(
+                        [(h, h) for h in self.hosts],
+                        value=host,
+                        allow_blank=False,
+                        id="f-host",
+                    )
+                    yield Label("", id="f-claude", classes="hint")
+            with Horizontal(classes="row"):
+                with Vertical(classes="col"):
+                    yield Label("folder", classes="field")
+                    yield Input(r["folder"], placeholder="~", id="f-folder")
+                with Vertical(classes="col"):
+                    yield Label("ssh login", classes="field")
+                    yield Input(
+                        r["login"], placeholder="the computer's default", id="f-login"
+                    )
+            yield Label("schedule", classes="field")
+            yield Input(r["schedule"], placeholder="weekly mon 09:00", id="f-schedule")
+            yield Label("", id="f-next", classes="hint")
+            yield Label(
+                "prompt — usually a skill, e.g. /literature-digest", classes="field"
+            )
+            yield TextArea(r["prompt"], id="f-prompt")
+            yield Checkbox(
+                "ask when finished — Claude asks “done?”, and yes closes the run",
+                r.get("ask_done", True),
+                id="f-ask-done",
+            )
+            yield Label("", id="f-error")
+            yield Label(
+                "ctrl+s save  ·  ctrl+o prompt in $EDITOR  ·  esc cancel",
+                id="form-keys",
+            )
+
+    def on_mount(self):
+        self.query_one("#f-name", Input).focus()
+        self._preview_schedule(self.routine["schedule"])
+        self._check(str(self.query_one("#f-host", Select).value))
+
+    def on_input_changed(self, e: Input.Changed) -> None:
+        if e.input.id == "f-schedule":
+            self._preview_schedule(e.value)
+
+    def on_select_changed(self, e: Select.Changed) -> None:
+        if e.select.id == "f-host":
+            self._check(str(e.value))
+
+    def _preview_schedule(self, text):
+        # Live: when it would next run, or what's wrong with the phrase.
+        hint = self.query_one("#f-next", Label)
+        try:
+            sched = routines.parse(text)
+        except ValueError as err:
+            msg = (
+                f"{err}"
+                if text.strip()
+                else (
+                    "daily 09:00 · weekdays 09:00 · weekly mon,thu 09:00 · "
+                    "monthly 1 09:00 · every 6h"
+                )
+            )
+            hint.update(Text(msg, style=AMBER if text.strip() else "dim"))
+            return
+        now = datetime.now()
+        t = routines.next_slot(sched, now, now.timestamp())
+        hint.update(
+            Text(f"{routines.describe(text)}  ·  next run {t:%a %d %b, %H:%M}", "dim")
+        )
+
+    def _check(self, host):
+        label = self.query_one("#f-claude", Label)
+        if self.check_claude is None:
+            label.update("")
+            return
+        label.update(Text("checking for claude…", "dim italic"))
+        self.check_claude(host, self._show_claude)
+
+    def _show_claude(self, host, where):
+        # where: a path (found), "" (not there) or None (couldn't reach it)
+        if not self.is_mounted or str(self.query_one("#f-host", Select).value) != host:
+            return  # the form closed, or you picked another computer meanwhile
+        label = self.query_one("#f-claude", Label)
+        if where:
+            label.update(Text("✓ claude found", GREEN))
+        elif where == "":
+            label.update(Text(f"✕ no claude on {host}", RED))
+        else:
+            label.update(Text(f"couldn't reach {host} to check for claude", "dim"))
+
+    @staticmethod
+    def _schedule_error(text):
+        try:
+            routines.parse(text)
+        except ValueError as err:
+            return f"schedule: {err}"
+        return ""
+
+    def _error(self, msg):
+        self.query_one("#f-error", Label).update(Text(msg, style=AMBER))
+
+    def action_editor(self):
+        area = self.query_one("#f-prompt", TextArea)
+        text = edit_in_editor(self.app, area.text)
+        if text is not None:
+            area.text = text.strip("\n")
+
+    def action_save(self):
+        r = {
+            "name": self.query_one("#f-name", Input).value.strip(),
+            "host": str(self.query_one("#f-host", Select).value),
+            "login": self.query_one("#f-login", Input).value.strip(),
+            "folder": self.query_one("#f-folder", Input).value.strip() or "~",
+            "schedule": " ".join(self.query_one("#f-schedule", Input).value.split()),
+            "enabled": self.routine["enabled"],
+            "ask_done": self.query_one("#f-ask-done", Checkbox).value,
+            "prompt": self.query_one("#f-prompt", TextArea).text.strip("\n"),
+        }
+        try:
+            routines.check_name(r["name"])
+        except ValueError as err:
+            return self._error(str(err))
+        if r["name"] in self.taken:
+            return self._error(f"name: {r['name']} is already used")
+        err = self._schedule_error(r["schedule"])
+        if err:
+            return self._error(err)
+        if not r["prompt"].strip():
+            return self._error("prompt: write what claude should start with")
+        self.dismiss(r)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class RoutineTable(DataTable):
+    """The routines panel. Its keys apply only while it has focus."""
+
+    BINDINGS = [
+        Binding("enter", "select_cursor", "run", key_display="enter"),
+        Binding("n", "app.routine_new", "new"),
+        Binding("e", "app.routine_edit", "edit"),
+        Binding("d", "app.routine_done", "done"),
+        # also there, kept out of the footer so it stays calm
+        Binding("x", "app.routine_delete", "delete", show=False),
+        Binding("space", "app.routine_toggle", "pause/resume", show=False),
+        Binding("c", "app.routine_copy", "duplicate", show=False),
+        Binding("E", "app.routine_editor", "prompt in $EDITOR", show=False),
+    ]
+
+
+# Session-table actions, hidden from the footer while the routines panel has focus.
+_SESSION_ACTIONS = {"menu", "window", "rename", "detach", "close", "awake", "login"}
+
+
 class Tuimux(App):
     COMMAND_PALETTE_BINDING = "p"  # open the command palette with p (not ctrl+p)
     CSS = """
     Screen { background: $surface; }
     #table-wrap {
-        border: round $primary 40%;
-        border-title-color: $primary;
+        border: round $primary 25%;
+        border-title-color: $primary 70%;
         border-title-style: bold;
         border-title-align: center;
         border-subtitle-color: $text-muted;
@@ -642,23 +1084,65 @@ class Tuimux(App):
         margin: 1 2;
         height: 3fr;
     }
-    DataTable { height: 1fr; background: $surface; }
+    /* Tables sit flat on their panel: no fill, no focus tint, no header band,
+       no hover band. Focus shows on the panel's frame instead (focus-within),
+       and only the focused table shows its cursor — a soft band that leaves
+       the row's own colours alone (cursor_foreground_priority="renderable"). */
+    DataTable { height: 1fr; background: transparent; }
+    DataTable:focus { background-tint: $foreground 0%; }
+    DataTable > .datatable--header,
+    DataTable:focus > .datatable--header {
+        color: $text-muted; text-style: bold;
+        background: transparent; background-tint: $foreground 0%;
+    }
+    DataTable > .datatable--cursor { background: transparent; text-style: none; }
+    DataTable:focus > .datatable--cursor { background: $primary 15%; text-style: none; }
+    DataTable > .datatable--hover { background: transparent; }
+    #table-wrap:focus-within, #routines-wrap:focus-within {
+        border: round $primary 70%;
+        border-title-color: $primary;
+    }
     #preview {
         height: 2fr;
         margin: 0 2 1 2;
         padding: 0 1;
-        border: round $primary 40%;
-        border-title-color: $primary;
+        border: round $primary 25%;
+        border-title-color: $primary 70%;
         border-title-style: bold;
         border-title-align: left;
         background: $surface;
         color: $text;
         overflow: hidden;
     }
-    DataTable > .datatable--cursor { background: $primary 20%; color: $text; }
-    DataTable > .datatable--header {
-        color: $text-muted; text-style: bold; background: $surface;
+    #routines-wrap {
+        border: round $primary 25%;
+        border-title-color: $primary 70%;
+        border-title-style: bold;
+        border-title-align: left;
+        border-subtitle-color: $text-muted;
+        border-subtitle-align: right;
+        padding: 0 2;
+        margin: 0 2 1 2;
+        height: 2fr;
     }
+    #routines-wrap DataTable { height: 1fr; }
+    #routine-detail {
+        height: 4; padding: 0 1; color: $text-muted;  /* the rule + 3 lines */
+        border-top: solid $primary 15%;
+    }
+    #form {
+        width: 92; height: auto; padding: 1 3; margin: 1;
+        background: $panel; border: round $primary 60%;
+    }
+    #form-title { color: $primary; text-style: bold; padding: 0 0 1 0; }
+    #form .row { height: auto; }
+    #form .col { width: 1fr; height: auto; }
+    #form .col:first-of-type { margin-right: 2; }
+    #form .field { color: $text-muted; margin-top: 1; }
+    #form .hint { height: 1; padding: 0 1; }
+    #form TextArea { height: 6; }
+    #f-error { margin-top: 1; height: auto; }
+    #form-keys { color: $text-muted; margin-top: 1; }
     #dialog {
         width: 56; height: auto; padding: 1 2; margin: 1;
         background: $panel; border: round $primary;
@@ -681,7 +1165,7 @@ class Tuimux(App):
         Binding("n", "rename", "rename"),
         Binding("d", "detach", "detach"),
         Binding("x", "close", "close"),
-        Binding("v", "preview", "preview"),
+        Binding("v", "panel", "panel"),
         Binding("o", "orgview", "org fleet"),
         Binding("u", "login", "set login"),
         Binding("c", "console", "tailscale"),
@@ -729,20 +1213,57 @@ class Tuimux(App):
         # (host, login, session|None) -> (kind, new_name, monotonic start) for an
         # action in flight; the row shows it until a later probe lands.
         self._pending = {}
+        # routines: the registry, run state, names being launched right now, the
+        # registry's mtime (to pick up hand edits), and the panel's last paint
+        self._routines = []
+        self._rstate = {}
+        self._launching = set()
+        # name -> (monotonic time, reason) of a failed start, for the retry backoff
+        self._failed = {}
+        self._claude_where = {}  # host -> where claude lives there ("" = not found)
+        self._routines_mtime = None
+        self._rtable = None
+        self._last_rsig = None
         self._preview = None  # cached Static handle for the live-preview panel
         # (host, session) currently mirrored in the preview, or None when the
         # cursor isn't on a live session. Guards stale peeks and avoids re-peeking
         # the same row on every re-render — only a real selection change re-kicks.
         self._preview_key = None
-        self._preview_on = True  # v toggles the panel (and its peeking) off/on
+        # what the bottom panel shows — "preview", "routines" or "none" (v cycles)
+        self._panel = "preview"
+        self._status_note = ""  # autostart / mouse state for the sessions border
         # "mine" = your own machines + hosts you've mapped; "org" = whole tailnet
         # fleet (every owner). o toggles it; session-only, not persisted.
         self._scope = "mine"
         # frame counter for the animated "running…" ellipsis (ticked by a timer)
         self._tick = 0
 
+    @property
+    def _preview_on(self):
+        # the live preview (and its pane captures) runs only while it's shown
+        return self._panel == "preview"
+
+    def check_action(self, action, parameters):
+        # While the routines panel has focus, the session keys don't apply (and
+        # drop out of the footer) — its own n/e/x/space take over.
+        if action in _SESSION_ACTIONS and self.focused is not None:
+            if self.focused is self._rtable:
+                return False
+        return True
+
+    def on_descendant_focus(self, event):
+        # The preview follows whichever table you're in.
+        if self._rtable is None or not isinstance(event.widget, DataTable):
+            return
+        self.refresh_bindings()
+        if event.widget is self._rtable:
+            self._sync_routine_detail()
+        else:
+            self._preview_key = ("",)  # force a re-target
+            self._sync_preview_target()
+
     def on_unmount(self):
-        save_snapshot(SNAPSHOT, self._hosts, self._snap)
+        save_snapshot(SNAPSHOT, self._hosts, self._snap, self._panel)
         if _POOL is not None:
             _POOL.close_all()
 
@@ -750,7 +1271,8 @@ class Tuimux(App):
         # Paint the last-known table before any probe: online hosts get their
         # remembered sessions as a "stale" result (dimmed, still actionable) that
         # the first real probe replaces.
-        hosts, snap = load_snapshot(SNAPSHOT)
+        hosts, snap, panel = load_snapshot(SNAPSHOT)
+        self._set_panel(panel, save=False)  # reopen in the view you left
         if not hosts:
             return
         self._hosts, self._snap = hosts, snap
@@ -780,8 +1302,21 @@ class Tuimux(App):
         yield Header(show_clock=True)
         with Vertical(id="table-wrap") as w:
             w.border_title = "tuimux by Ersilia"
-            yield SessionTable(cursor_type="row", zebra_stripes=False)
+            yield SessionTable(
+                cursor_type="row",
+                zebra_stripes=False,
+                cursor_foreground_priority="renderable",
+            )
+        # the bottom panel: one of these is shown at a time (v cycles; see PANELS)
         yield Static(id="preview")
+        with Vertical(id="routines-wrap") as w:
+            w.border_title = "routines"
+            yield RoutineTable(
+                cursor_type="row",
+                zebra_stripes=False,
+                cursor_foreground_priority="renderable",
+            )
+            yield Static(id="routine-detail")
         yield Footer()
 
     def on_mount(self):
@@ -838,6 +1373,18 @@ class Tuimux(App):
         ):
             t.add_column(col, key=key, width=w)
         t.focus()
+        r = self._rtable = self.query_one(RoutineTable)
+        for col, key, w in (
+            ("ROUTINE", "name", 24),
+            ("COMPUTER", "host", 20),
+            ("SCHEDULE", "schedule", 22),
+            ("NEXT", "next", 15),
+            ("RUNS", "runs", 10),
+            ("LAST RUN", "last", 10),
+            ("STATUS", "status", 18),
+        ):
+            r.add_column(col, key=key, width=w)
+        self._load_routines()
         self._preview = self.query_one("#preview", Static)
         self._set_preview_idle()
         self._restore_snapshot()
@@ -848,6 +1395,8 @@ class Tuimux(App):
         # Animate the "running…" ellipsis. Cheap: it re-renders, but the diff only
         # repaints the STATE cells that actually change — a no-op when nothing runs.
         self.set_interval(0.5, self._tick_anim)
+        # Start due routines (also run as each host's probe lands, see _got).
+        self.set_interval(30, self._tick_routines)
 
     def _tick_anim(self):
         self._tick += 1
@@ -879,13 +1428,26 @@ class Tuimux(App):
     def _set_status_note(self, auto, mouse):
         # Note in the panel's bottom border whether new terminals auto-attach and
         # whether tmux mouse mode (wheel scrolls the pane) is on.
+        self._status_note = (
+            f"autostart: {auto or 'off'}  ·  mouse scroll: {mouse or 'off'}"
+        )
+        self._refresh_badge()
+
+    def _refresh_badge(self, pending=None):
+        # Routines that want you, flagged on the sessions box's border while the
+        # routines view isn't showing — so they reach you from any view.
         try:
             wrap = self.query_one("#table-wrap")
         except Exception:
             return
-        wrap.border_subtitle = (
-            f"autostart: {auto or 'off'}  ·  mouse scroll: {mouse or 'off'}"
-        )
+        if pending is None:
+            pending = self._pending_routines(time.time())
+        note = self._status_note
+        if pending and self._panel != "routines":
+            what = "routine needs" if pending == 1 else "routines need"
+            badge = f"[blink bold {AMBER}]● {pending} {what} you (v)[/]"
+            note = f"{badge}  ·  {note}" if note else badge
+        wrap.border_subtitle = note
 
     @work(thread=True)
     def _capture_self_window(self):
@@ -1001,11 +1563,11 @@ class Tuimux(App):
 
     @work(thread=True, group="probe")
     def _probe_one(self, h, key):
-        started = time.monotonic()
+        started, wall = time.monotonic(), time.time()
         _host, info = _probe_or_offline(h)
-        self.call_from_thread(self._got, key, info, started)
+        self.call_from_thread(self._got, key, info, started, wall)
 
-    def _got(self, key, info, started=None):
+    def _got(self, key, info, started=None, wall=None):
         # A probe that began after an action reflects its outcome: drop the
         # pending label. An older probe still in flight must not, or the row
         # would flicker back to its pre-action state.
@@ -1031,7 +1593,10 @@ class Tuimux(App):
             self._snap[key] = info["sessions"]
         self._results[key] = info
         self._probing.discard(key)
+        if info.get("reachable") and wall is not None:
+            self._track_routine_runs(key, info, wall)
         self._request_render()
+        self._tick_routines()  # a host just answered: start its due routines now
 
     @work(exclusive=True, thread=True, group="windows")
     def _scan_windows(self):
@@ -1062,8 +1627,15 @@ class Tuimux(App):
     # cursor (only on a real selection change) and on every heartbeat, so the
     # selected session stays live. Capture is read-only (tmux capture-pane), so
     # it never steals focus or disturbs the session.
-    def on_data_table_row_highlighted(self, _event):
-        self._sync_preview_target()
+    def on_data_table_row_highlighted(self, event):
+        # Only the table you're in drives the preview (the other one re-renders
+        # and moves its cursor in the background).
+        if event.data_table is not self.focused:
+            return
+        if event.data_table is self._rtable:
+            self._sync_routine_detail()
+        else:
+            self._sync_preview_target()
 
     def _sync_preview_target(self):
         # Point the preview at the current row, if it's a live session. Re-kick a
@@ -1125,13 +1697,25 @@ class Tuimux(App):
             Text("  Move to a session to preview its output.", style="dim italic")
         )
 
-    def action_preview(self):
-        self._preview_on = not self._preview_on
-        self._preview.display = self._preview_on
-        if self._preview_on:
+    def action_panel(self):
+        # v: preview → routines → none → preview
+        self._set_panel(PANELS[(PANELS.index(self._panel) + 1) % len(PANELS)])
+
+    def _set_panel(self, panel, save=True):
+        self._panel = panel
+        self._preview.display = panel == "preview"
+        self.query_one("#routines-wrap").display = panel == "routines"
+        if panel == "routines":
+            self._rtable.focus()  # ready for n / e / x / space / enter
+            self._sync_routine_detail()
+        else:
+            self._table.focus()
             # Force a re-target: the key may be stale from while it was hidden.
-            self._preview_key = None
+            self._preview_key = ("",)
             self._sync_preview_target()
+        self._refresh_badge()
+        if save:  # remember it now, not only on a clean exit
+            save_snapshot(SNAPSHOT, self._hosts, self._snap, panel)
 
     def _window_locs(self, session_name):
         """Labels for every terminal window *on this Mac* showing this session.
@@ -1551,6 +2135,7 @@ class Tuimux(App):
     def _render_now(self):
         self._render_pending = False
         self._render()
+        self._render_routines()
 
     def _render(self):
         # Skip painting the (hidden) table while a dialog is up — keeps menus
@@ -1630,8 +2215,11 @@ class Tuimux(App):
         self.set_timer(5.0, self._rescan_windows)
 
     # ---- actions ----
-    def on_data_table_row_selected(self, _):
-        self.action_open()
+    def on_data_table_row_selected(self, event):
+        if event.data_table is self._rtable:
+            self.action_routine_run()
+        else:
+            self.action_open()
 
     def action_menu(self):
         m = self._cur()
@@ -1785,6 +2373,500 @@ class Tuimux(App):
         _run(["__setlogin", host, users], timeout=ACTION_TIMEOUT)
         # The host list itself changes (new login rows), so refresh everything now.
         self.call_from_thread(self.reload, True)
+
+    # ---- routines ----
+    # A second panel of Claude prompts you run on a schedule, each on one fixed
+    # computer. The dashboard is the scheduler: while it's open (and on opening
+    # it) a due routine starts as a detached session on its computer, with
+    # claude already running the prompt, and waits there for you. At most one
+    # session per routine; however many runs were missed, it starts once.
+    def _load_routines(self):
+        try:
+            self._routines = routines.load_registry()
+        except ValueError as err:
+            self._routines = []
+            self.notify(f"routines: {err}", severity="error", timeout=10)
+        self._routines_mtime = self._registry_mtime()
+        self._rstate = routines.load_state()
+        now = time.time()
+        new = [r["name"] for r in self._routines if r["name"] not in self._rstate]
+        for name in new:  # count a new routine from now, so adding it doesn't fire it
+            self._rstate[name] = routines.new_entry(now)
+        if new:
+            self._save_state()
+        self._last_rsig = None
+        self._request_render()
+
+    @staticmethod
+    def _registry_mtime():
+        try:
+            return os.stat(routines.REGISTRY).st_mtime
+        except OSError:
+            return None
+
+    def _save_routines(self):
+        try:
+            routines.save_registry(self._routines)
+        except OSError as err:
+            self.notify(f"couldn't save routines: {err}", severity="error")
+        self._routines_mtime = self._registry_mtime()
+        self._last_rsig = None
+        self._request_render()
+
+    def _save_state(self):
+        try:
+            routines.save_state(self._rstate)
+        except OSError:
+            pass
+
+    def _host_login(self, host):
+        # the connect-as login for a computer (its primary row), as the sessions use
+        return next((h[9] for h in self._hosts if h[0] == host and h[10]), "")
+
+    def _routine_info(self, r):
+        """(login, probe info or None, its session dict or None) for a routine."""
+        login = r["login"] or self._host_login(r["host"])
+        info = self._results.get((r["host"], login))
+        sess = None
+        if info and info.get("reachable"):
+            name = routines.session_name(r["name"])
+            sess = next((s for s in info["sessions"] if s["name"] == name), None)
+        return login, info, sess
+
+    def _routine_state(self, r, now):
+        """Everything a routine's row shows, worked out once (starts nothing)."""
+        login, info, sess = self._routine_info(r)
+        try:
+            sched = routines.parse(r["schedule"])
+        except ValueError:
+            sched = None
+        entry = self._rstate.get(r["name"]) or routines.new_entry(now)
+        due = bool(sched) and routines.is_due(sched, routines.base_time(entry), now)
+        status = _routine_status(
+            sched_ok=sched is not None,
+            enabled=r["enabled"],
+            sess=sess,
+            due=due and r["enabled"],
+            live=bool(info and info.get("reachable") and not info.get("stale")),
+            probed=bool(info and not info.get("stale")) or self._host_down(r["host"]),
+            failed=r["name"] in self._failed,
+            launching=r["name"] in self._launching,
+            opened=entry.get("opened", False),
+            done=bool(entry.get("done") and entry.get("last")),
+            tick=self._tick,
+        )
+        return sched, entry, due, status
+
+    def _host_down(self, host):
+        # Known to be unreachable without probing: Tailscale reports it offline
+        # (offline hosts are never probed), or it isn't in the tailnet at all.
+        if not self._hosts:
+            return False  # discovery hasn't answered yet
+        row = next((h for h in self._hosts if h[0] == host), None)
+        return row is None or row[2] == "offline"
+
+    def _host_accent(self, host):
+        # the machine's colour, as on its sessions and its tmux status bar
+        return next((h[8] for h in self._hosts if h[0] == host and len(h) > 8), "")
+
+    def _routine_row(self, r, now):
+        """The cells of one routine's row (pure: reads state, starts nothing)."""
+        sched, entry, due, (dot, word, color, pending) = self._routine_state(r, now)
+        accent = self._host_accent(r["host"]) if r["enabled"] else "dim"
+        flash = f"blink bold {color}" if pending else color
+        if sched is None or not r["enabled"]:
+            nxt = ("—", "dim")
+        elif due:
+            nxt = ("now", f"bold {GREEN}")
+        else:
+            nowdt = datetime.fromtimestamp(now)
+            t = routines.next_slot(sched, nowdt, routines.base_time(entry))
+            soon = (t - nowdt).total_seconds() < 3600
+            nxt = (_when(t, nowdt), "" if soon else "dim")
+        last = entry.get("last")
+        return (
+            ((dot + " ", flash), (r["name"], accent)),
+            ((r["host"], accent),),
+            ((routines.describe(r["schedule"]), "dim"),),
+            (nxt,),
+            _runs_strip(entry, color),
+            (((_ago(now - last) if last else "never"), "dim"),),
+            ((word, flash),),
+        )
+
+    def _pending_routines(self, now):
+        return sum(1 for r in self._routines if self._routine_state(r, now)[3][3])
+
+    def _render_routines(self):
+        t = self._rtable
+        # not mounted yet, already torn down (a timer firing on exit), or hidden
+        # behind a dialog: nothing to paint
+        if t is None or t.parent is None or self._modal_open():
+            return
+        now = time.time()
+        pending = self._pending_routines(now)
+        self._refresh_badge(pending)
+        # t.parent is the panel: a direct handle that works whichever screen is up
+        t.parent.border_subtitle = _routine_summary(len(self._routines), pending)
+        rows = [self._routine_row(r, now) for r in self._routines]
+        sig = tuple(rows)
+        if sig == self._last_rsig:
+            return
+        prev = t.cursor_row
+        if self._last_rsig is not None and len(self._last_rsig) == len(rows):
+            for i, cells in enumerate(rows):
+                for c, cell in enumerate(cells):
+                    if cell != self._last_rsig[i][c]:
+                        t.update_cell_at(Coordinate(i, c), self._cell(cell))
+        else:
+            t.clear()
+            t.add_rows(tuple(self._cell(c) for c in cells) for cells in rows)
+            if rows:
+                t.move_cursor(row=min(max(prev, 0), len(rows) - 1))
+        self._last_rsig = sig
+        if self._panel == "routines":
+            self._sync_routine_detail()  # edits, failures and renames show here too
+
+    def _cur_routine(self):
+        t = self._rtable
+        if t is not None and 0 <= t.cursor_row < len(self._routines):
+            return self._routines[t.cursor_row]
+        return None
+
+    def _tick_routines(self):
+        if self._table is None or self._modal_open():
+            return
+        if self._registry_mtime() != self._routines_mtime:
+            self._load_routines()  # edited by hand
+        now = time.time()
+        for r in self._routines:
+            if not r["enabled"] or r["name"] in self._launching:
+                continue
+            failed = self._failed.get(r["name"])
+            if failed and time.monotonic() - failed[0] < ROUTINE_RETRY:
+                continue
+            try:
+                sched = routines.parse(r["schedule"])
+            except ValueError:
+                continue
+            entry = self._rstate.get(r["name"])
+            if not entry or not routines.is_due(sched, routines.base_time(entry), now):
+                continue
+            login, info, sess = self._routine_info(r)
+            # Only on a fresh answer from its computer (not the startup snapshot),
+            # and never a second session while the last one is still there.
+            if not info or not info.get("reachable") or info.get("stale"):
+                continue
+            if sess is not None:
+                run = routines.current_run(entry)
+                if run and run["done"] is None and not run["late"]:
+                    run["late"] = True  # its next slot came while it was still open
+                    self._save_state()
+                continue
+            self._launching.add(r["name"])
+            self._launch(r, login, False)
+        self._request_render()
+
+    @work(thread=True, group="routine")
+    def _launch(self, r, login, open_after):
+        out = launch_routine(r["host"], login, r)
+        self.call_from_thread(self._launched, r, login, out, open_after)
+
+    def _launched(self, r, login, out, open_after):
+        self._launching.discard(r["name"])
+        if "__LAUNCHED__" in out:
+            self._failed.pop(r["name"], None)
+            entry = self._rstate.setdefault(r["name"], routines.new_entry(time.time()))
+            entry["last"] = time.time()
+            entry["opened"] = bool(open_after)  # run now opens a tab straight away
+            entry["done"] = None
+            routines.add_run(entry, entry["last"])
+            self._save_state()
+            self.notify(f"started {r['name']} on {r['host']}", timeout=4)
+        elif "__EXISTS__" not in out:
+            why = out.split("__FAIL__", 1)[1].strip() if "__FAIL__" in out else ""
+            why = why or "couldn't reach it"
+            # Say it once per failure streak (and whenever you asked for it),
+            # not on every retry.
+            if r["name"] not in self._failed:  # a new failure streak: remember it once
+                entry = self._rstate.setdefault(
+                    r["name"], routines.new_entry(time.time())
+                )
+                routines.add_run(entry, time.time(), failed=True)
+                self._save_state()
+            if open_after or r["name"] not in self._failed:
+                self.notify(
+                    f"couldn't start {r['name']} on {r['host']}: {why}",
+                    severity="error",
+                    timeout=10,
+                )
+            self._failed[r["name"]] = (time.monotonic(), why)
+            self._request_render()
+            return
+        self._reprobe(r["host"], login)
+        if open_after:
+            name = routines.session_name(r["name"])
+            self._spawn(["__open", "auto", r["host"], login, name, "attach"])
+            self._after_open()
+        self._request_render()
+
+    def _sync_routine_detail(self):
+        r = self._cur_routine()
+        detail = self.query_one("#routine-detail", Static)
+        if r is None:  # nothing yet: say what routines are, and how to start
+            detail.update(
+                Text.assemble(
+                    ("No routines yet.", "bold"),
+                    "  Claude prompts that run on a schedule, each on one computer.\n",
+                    ("Press ", "dim"),
+                    ("n", f"bold {AMBER}"),
+                    (" to add one.", "dim"),
+                )
+            )
+            return
+        failed = self._failed.get(r["name"], (0, ""))[1]
+        detail.update(_routine_detail(r, self._rstate.get(r["name"]), failed))
+
+    def _mark_routines(self, name, **fields):
+        entry = self._rstate.setdefault(name, routines.new_entry(time.time()))
+        if any(entry.get(k) != v for k, v in fields.items()):
+            entry.update(fields)
+            self._save_state()
+
+    def _track_routine_runs(self, key, info, wall):
+        """Learn from a fresh probe whether each routine's run was joined or ended.
+
+        Joined: its session has a client attached. Ended: its session is gone,
+        and this probe started after the run did — then the run counts as done.
+        """
+        names = {s["name"]: s for s in info["sessions"]}
+        for r in self._routines:
+            login = r["login"] or self._host_login(r["host"])
+            entry = self._rstate.get(r["name"])
+            if (r["host"], login) != key or not entry or not entry.get("last"):
+                continue
+            sess = names.get(routines.session_name(r["name"]))
+            if sess is not None:
+                if sess["attached"] or sess["nclients"]:
+                    self._mark_routines(r["name"], opened=True)
+            elif not entry.get("done") and wall > entry["last"]:
+                self._finish_run(r, login, wall)
+
+    def _finish_run(self, r, login, when):
+        """Record a run as done, then ask its computer what the run produced."""
+        entry = self._rstate.setdefault(r["name"], routines.new_entry(when))
+        entry["done"] = when
+        run = routines.current_run(entry)
+        if run is not None and run["done"] is None:
+            run["done"] = when
+        self._save_state()
+        if run is not None:
+            self._fetch_outcome(r, login, run["start"])
+
+    @work(thread=True, group="outcome")
+    def _fetch_outcome(self, r, login, start):
+        out = host_read("outcome", r["host"], login, r["name"]) or ""
+        line = next((ln.strip() for ln in out.splitlines() if ln.strip()), "")
+        if line:
+            self.call_from_thread(self._got_outcome, r["name"], start, line[:200])
+
+    def _got_outcome(self, name, start, line):
+        entry = self._rstate.get(name) or {}
+        run = next((x for x in entry.get("runs", []) if x["start"] == start), None)
+        if run is not None:
+            run["outcome"] = line
+            self._save_state()
+            self._last_rsig = None
+            self._request_render()
+
+    def action_routine_done(self):
+        r = self._cur_routine()
+        if r is None:
+            return
+        login, info, sess = self._routine_info(r)
+        entry = self._rstate.get(r["name"]) or {}
+        if sess is None:
+            if entry.get("last") and not entry.get("done"):
+                self._finish_run(r, login, time.time())
+                self._request_render()
+            return
+
+        def ok(yes):
+            if yes:
+                self._finish_run(r, login, time.time())
+                self._act("kill", r["host"], login, sess["name"])
+
+        self.push_screen(
+            Confirm(
+                f"Mark “{r['name']}” done?\nIts session on {r['host']} is closed.",
+                ok_label="✓   yes, it's done",
+            ),
+            ok,
+        )
+
+    def action_routine_run(self):
+        r = self._cur_routine()
+        if r is None or r["name"] in self._launching:
+            return
+        login, info, sess = self._routine_info(r)
+        if sess is not None:  # already running: just go to it
+            self._mark_routines(r["name"], opened=True)
+            self._spawn(["__open", "auto", r["host"], login, sess["name"], "attach"])
+            self._after_open()
+            return
+        self._launching.add(r["name"])
+        self._request_render()
+        self._launch(r, login, True)
+
+    def _compute_hosts(self, also=""):
+        names = []
+        for h in self._hosts:
+            if h[4] != "consumer" and h[0] not in names:
+                names.append(h[0])
+        if also and also not in names:
+            names.insert(0, also)
+        return names or ["?"]
+
+    def action_routine_new(self):
+        blank = {
+            "name": "",
+            "host": _ENV.get("TUIMUX_SELF_HOST", ""),  # this computer by default
+            "login": "",
+            "folder": "~",
+            "schedule": "weekly mon 09:00",
+            "enabled": True,
+            "ask_done": True,
+            "prompt": "",
+        }
+
+        def done(r):
+            if r:
+                self._routines.append(r)
+                self._rstate[r["name"]] = routines.new_entry(time.time())
+                self._save_state()
+                self._save_routines()
+
+        taken = {x["name"] for x in self._routines}
+        self.push_screen(
+            RoutineForm(
+                blank, self._compute_hosts(), taken, check_claude=self._check_claude
+            ),
+            done,
+        )
+
+    def action_routine_copy(self):
+        src = self._cur_routine()
+        if src is None:
+            return
+        taken = {x["name"] for x in self._routines}
+        name, n = f"{src['name']}-copy", 2
+        while name in taken:
+            name, n = f"{src['name']}-copy-{n}", n + 1
+        # paused, so the copy can't fire before you've adjusted it
+        copy = {**src, "name": name, "enabled": False}
+
+        def done(r):
+            if r:
+                self._routines.append(r)
+                self._rstate[r["name"]] = routines.new_entry(time.time())
+                self._save_state()
+                self._save_routines()
+                self.notify(f"{r['name']} added, paused — space resumes it", timeout=4)
+
+        self.push_screen(
+            RoutineForm(
+                copy,
+                self._compute_hosts(also=src["host"]),
+                taken,
+                title=f"duplicate {src['name']}",
+                check_claude=self._check_claude,
+            ),
+            done,
+        )
+
+    def action_routine_editor(self):
+        r = self._cur_routine()
+        if r is None:
+            return
+        text = edit_in_editor(self, r["prompt"])
+        if text is not None and text.strip() and text.strip("\n") != r["prompt"]:
+            r["prompt"] = text.strip("\n")
+            self._save_routines()
+            self.notify(f"{r['name']}: prompt saved", timeout=2)
+
+    def _check_claude(self, host, callback):
+        # Where claude lives on `host` — remembered for the session once known.
+        if host in self._claude_where:
+            callback(host, self._claude_where[host])
+            return
+        self._claude_check(host, callback)
+
+    @work(thread=True, group="claude-check")
+    def _claude_check(self, host, callback):
+        out = host_read("claude_check", host, self._host_login(host))
+        if out is None:
+            where = None  # couldn't reach it: say so, and check again next time
+        else:
+            last = (out.strip().splitlines() or [""])[-1]
+            where = "" if last in ("", "__NONE__") else last
+        self.call_from_thread(self._claude_checked, host, where, callback)
+
+    def _claude_checked(self, host, where, callback):
+        if where is not None:
+            self._claude_where[host] = where
+        callback(host, where)
+
+    def action_routine_edit(self):
+        old = self._cur_routine()
+        if old is None:
+            return
+
+        def done(r):
+            if not r:
+                return
+            i = self._routines.index(old)
+            self._routines[i] = r
+            if r["name"] != old["name"]:  # carry its run history over
+                self._rstate[r["name"]] = self._rstate.pop(
+                    old["name"], routines.new_entry(time.time())
+                )
+                self._save_state()
+            self._save_routines()
+
+        taken = {x["name"] for x in self._routines} - {old["name"]}
+        hosts = self._compute_hosts(also=old["host"])
+        self.push_screen(
+            RoutineForm(old, hosts, taken, check_claude=self._check_claude), done
+        )
+
+    def action_routine_delete(self):
+        r = self._cur_routine()
+        if r is None:
+            return
+
+        def done(ok):
+            if ok and r in self._routines:
+                self._routines.remove(r)
+                self._rstate.pop(r["name"], None)
+                self._save_state()
+                self._save_routines()
+
+        self.push_screen(
+            Confirm(
+                f"Delete routine “{r['name']}”?\n"
+                "Its session, if one is open, keeps running.",
+                ok_label="✕   yes, delete it",
+            ),
+            done,
+        )
+
+    def action_routine_toggle(self):
+        r = self._cur_routine()
+        if r is None:
+            return
+        r["enabled"] = not r["enabled"]
+        self._save_routines()
+        self.notify(f"{r['name']} {'resumed' if r['enabled'] else 'paused'}", timeout=2)
 
 
 def run():
