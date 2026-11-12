@@ -1339,7 +1339,7 @@ def test_tabs_cell_tints_claude():
     tc = app.Tuimux._tabs_cell
     assert tc("1  zsh") == (("1  zsh", "dim"),)
     agent = tc("2  claude")
-    assert agent[-1] == ("claude", app.VIOLET)  # command tinted violet
+    assert agent[-1] == ("claude", app.AGENT)  # command tinted blue
     assert "dim" in agent[0][1]  # the count stays dim
 
 
@@ -1602,10 +1602,10 @@ def test_folder_cell_shows_last_component():
 def test_tabs_cell_drops_lone_window_count():
     # single window → just the command, no "1" prefix; violet when it's claude
     assert app.Tuimux._tabs_cell("zsh") == (("zsh", "dim"),)
-    assert app.Tuimux._tabs_cell("claude") == (("claude", app.VIOLET),)
+    assert app.Tuimux._tabs_cell("claude") == (("claude", app.AGENT),)
     # multi-window keeps the count and still tints a claude command
     cell = app.Tuimux._tabs_cell("3  claude")
-    assert cell[0] == ("3  ", "dim") and cell[1] == ("claude", app.VIOLET)
+    assert cell[0] == ("3  ", "dim") and cell[1] == ("claude", app.AGENT)
 
 
 def test_waiting_state_blinks_running_and_idle_do_not():
@@ -2317,7 +2317,7 @@ def _routine_app(sessions=None, reachable=True, stale=False, since=0.0):
 
 
 def _status(a):
-    return _cell_text(a._routine_row(a._routines[0], app.time.time())[-1])
+    return _cell_text(a._routine_row(a._routines[0], app.time.time())[2])
 
 
 def test_routine_status_lifecycle():
@@ -2326,37 +2326,49 @@ def test_routine_status_lifecycle():
         sched_ok=True, enabled=True, sess=None, due=False, live=True, probed=True
     )
     cases = [
-        ({}, ("○", "scheduled", False)),
-        ({"due": True}, ("●", "starting…", False)),
-        (
-            {"due": True, "live": False, "probed": False},
-            ("◌", "due · checking…", False),
-        ),
-        ({"due": True, "live": False}, ("◌", "due · offline", True)),
-        ({"failed": True}, ("✕", "start failed", True)),
-        ({"sess": agent("idle")}, ("●", "ready", True)),  # started, not joined yet
-        ({"sess": agent("idle"), "opened": True}, ("●", "not done", False)),
-        ({"sess": agent("waiting"), "opened": True}, ("●", "waiting", True)),
-        ({"sess": agent("running")}, ("●", "running", False)),
-        ({"sess": _live("routine-lit")}, ("✕", "shell only", True)),
-        ({"sess": agent("idle"), "opened": True, "due": True}, ("●", "overdue", True)),
-        ({"done": True}, ("✓", "done", False)),
-        ({"enabled": False}, ("⏸", "paused", False)),
-        ({"sched_ok": False}, ("✕", "bad schedule", False)),
+        ({}, ("not yet", False)),
+        ({"done_ago": "2d ago"}, ("done 2d ago", False)),
+        ({"due": True}, ("starting", False)),
+        ({"due": True, "live": False, "probed": False}, ("not run yet", False)),
+        ({"due": True, "live": False}, ("not run yet", False)),
+        ({"due": True, "live": False, "done_ago": "8d ago"}, ("not run yet", False)),
+        ({"failed": True}, ("failed", False)),
+        ({"sess": agent("idle")}, ("unopened", True)),  # started, never joined
+        ({"sess": agent("idle"), "opened": True}, ("idle", False)),
+        ({"sess": agent("waiting"), "opened": True}, ("waiting", True)),
+        ({"sess": agent("waiting")}, ("waiting", True)),
+        ({"sess": agent("running")}, ("running", False)),
+        ({"sess": _live("routine-lit")}, ("no claude", True)),
+        ({"sess": agent("idle"), "opened": True, "due": True}, ("overdue", True)),
+        ({"enabled": False}, ("paused", False)),
+        ({"sched_ok": False}, ("bad schedule", False)),
     ]
-    for kw, (dot, word, pending) in cases:
+    for kw, (word, pending) in cases:
         got = app._routine_status(**{**base, **kw})
-        assert (got[0], got[1], got[3]) == (dot, word, pending), (kw, got)
+        assert (got[0], got[2]) == (word, pending), (kw, got)
 
 
-def test_routine_row_blinks_only_when_pending_and_uses_the_machine_accent():
-    a = _routine_app(reachable=False)  # due, computer offline: pending
-    hosts = [h[:8] + ("#ff9e64",) + h[9:] for h in a._hosts]
-    a._hosts = hosts
+def test_routine_row_blinks_only_when_an_open_run_wants_you():
+    asking = {**_live("routine-lit"), "agent": True, "state": "waiting"}
+    a = _routine_app(sessions=[asking], since=app.time.time())  # not due yet
     cells = a._routine_row(a._routines[0], app.time.time())
-    assert "blink" in _cell_styles(cells[-1]) and "#ff9e64" in _cell_styles(cells[1])
+    assert _cell_text(cells[0]).strip() == "lit"
+    assert _cell_text(cells[1]) == "daily 09:00"
+    assert _cell_text(cells[2]) == "waiting" and "blink" in _cell_styles(cells[2])
+    assert a._pending_routines(app.time.time()) == {"waiting": 1}
+    a = _routine_app(reachable=False)  # due, but its computer is off: nothing to do
+    a._hosts = [h[:8] + ("#ff9e64",) + h[9:] for h in a._hosts]
+    cells = a._routine_row(a._routines[0], app.time.time())
+    assert _cell_text(cells[2]) == "not run yet" and "blink" not in _cell_styles(
+        cells[2]
+    )
+    assert a._pending_routines(app.time.time()) == {}
+    header = a._host_header_row("box")
+    assert _cell_text(header[0]) == "○ box" and "#ff9e64" in _cell_styles(header[0])
+    assert _cell_text(header[1]) == "offline"
     calm = _routine_app(sessions=[], since=app.time.time())  # just scheduled
-    assert "blink" not in _cell_styles(calm._routine_row(calm._routines[0], 0)[-1])
+    assert "blink" not in _cell_styles(calm._routine_row(calm._routines[0], 0)[2])
+    assert _cell_text(calm._host_header_row("box")[1]) == "online"
 
 
 def test_probe_marks_a_run_joined_then_done():
@@ -2390,12 +2402,13 @@ def test_mark_done_closes_the_session_and_records_it():
 
 
 def test_badge_counts_pending_outside_the_routines_view():
-    a = _routine_app(reachable=False)  # one pending routine
+    asking = {**_live("routine-lit"), "agent": True, "state": "waiting"}
+    a = _routine_app(sessions=[asking], since=app.time.time())  # one open run asking
     wrap = SimpleNamespace(border_subtitle="")
     a.query_one = lambda sel, *_: wrap
     a._status_note = "autostart: on"
     a._refresh_badge()
-    assert "1 routine needs you" in wrap.border_subtitle
+    assert "routines: 1 waiting (v)" in wrap.border_subtitle
     assert wrap.border_subtitle.endswith("autostart: on")
     a._panel = "routines"
     a._refresh_badge()
@@ -2431,7 +2444,7 @@ def test_failed_start_backs_off_and_warns_once():
     a._request_render = lambda: None
     r = a._routines[0]
     a._launched(r, "u", "__FAIL__ couldn't write the prompt file (disk full?)\n", False)
-    assert _status(a) == "start failed"
+    assert _status(a) == "failed"
     assert _ticked(a) == []  # no retry on the next probe
     a._launched(r, "u", "__FAIL__ couldn't write the prompt file (disk full?)\n", False)
     assert len(toasts) == 1 and "disk full" in toasts[0]
@@ -2483,24 +2496,65 @@ def test_v_cycles_the_bottom_panel_and_remembers_it():
 def test_routine_detail_card():
     r = _routine(folder="~/repo", enabled=False, prompt="/lit\nmore")
     entry = routines.new_entry(0)
-    first, second, third = app._routine_detail(r, entry, now=1000).plain.split("\n")
-    assert first == "Daily · 09:00  ·  ~/repo  ·  asks when finished  ·  paused"
-    assert second == "/lit  ↵  more"  # the prompt on one line
-    assert third == "not run yet"
+    first, second = app._routine_detail(r, entry, now=1000).plain.split("\n")
+    assert first == "Daily · 09:00  ·  ~/repo  ·  /lit  ↵  more  ·  paused"
+    assert second == "never run"
+    day = app.datetime.fromtimestamp(0).strftime("%-d %b")
+    routines.add_run(entry, 0, failed=True)
     routines.add_run(entry, 0)
     entry["runs"][-1].update(done=1500.0, outcome="12 new papers")
-    third = app._routine_detail(r, entry, now=1500 + 7200).plain.split("\n")[2]
-    assert third == "last outcome: 12 new papers  ·  2h ago  ·  took 25m"
-    failed = app._routine_detail(r, entry, "disk full").plain.split("\n")[2]
-    assert failed == "last start failed: disk full"
+    second = app._routine_detail(r, entry, now=9000).plain.split("\n")[1]
+    assert second == f"last outcome: 12 new papers  ·  took 25m  ·  earlier: ✕ {day}"
+    failed = app._routine_detail(r, entry, "disk full").plain.split("\n")[1]
+    assert failed.startswith("couldn't start: disk full")
+
+
+def test_short_schedule_phrases():
+    cases = {
+        "weekly mon 09:00": "Mon 09:00",
+        "weekly mon,thu 9:00": "Mon,Thu 09:00",
+        "daily 08:00": "daily 08:00",
+        "weekdays 07:30": "weekdays 07:30",
+        "monthly 1 09:00": "monthly 1 09:00",
+        "every  6h": "every 6h",
+        "nonsense": "nonsense",
+    }
+    for phrase, short in cases.items():
+        assert routines.short(phrase) == short
+
+
+def test_routines_are_grouped_by_computer_in_tailnet_order():
+    rs = [
+        _routine(name="a", host="me"),
+        _routine(name="b", host="gone"),
+        _routine(name="c", host="box"),
+        _routine(name="d", host="me"),
+    ]
+    groups = app._routine_groups(rs, [_BOX, _ME])
+    assert [(h, [r["name"] for r in g]) for h, g in groups] == [
+        ("box", ["c"]),
+        ("me", ["a", "d"]),
+        ("gone", ["b"]),  # not in the tailnet: last
+    ]
+
+
+def test_cursor_on_a_header_row_selects_no_routine():
+    a = _routine_app()
+    a._rmeta = [("host", "box"), ("routine", "lit")]
+    a._rtable = SimpleNamespace(cursor_row=0)
+    assert a._cur_routine() is None
+    a._rtable.cursor_row = 1
+    assert a._cur_routine()["name"] == "lit"
+    meta = [("host", "box"), ("routine", "lit")]
+    assert app._keep_cursor([], meta, 0) == 1  # lands on the first routine
+    assert app._keep_cursor(meta, [("host", "me")] + meta, 1) == 2  # follows it
 
 
 def test_routines_panel_summary():
-    assert app._routine_summary(0, 0) == ""
-    assert app._routine_summary(1, 0) == "1 routine"
-    assert app._routine_summary(8, 4).startswith("8 routines  ·  ")
-    assert "4 need you" in app._routine_summary(8, 4)
-    assert "1 needs you" in app._routine_summary(3, 1)
+    assert app._routine_summary(0, {}) == ""
+    assert app._routine_summary(1, {}) == "1 routine"
+    note = app._routine_summary(8, {"waiting": 1, "unopened": 2})
+    assert note.startswith("8 routines:") and "1 waiting  ·  2 unopened" in note
 
 
 def test_routine_on_a_computer_tailscale_reports_offline_is_offline_not_checking():
@@ -2509,11 +2563,13 @@ def test_routine_on_a_computer_tailscale_reports_offline_is_offline_not_checking
         _ME,
         ("box", False, "offline", "2h ago", "compute", "o", "", False, "", "u", True),
     ]
-    assert _status(a) == "due · offline"
+    assert _status(a) == "not run yet"
+    assert a._host_state("box") == "offline"
     a._hosts = [_ME]  # not in the tailnet at all
-    assert _status(a) == "due · offline"
+    assert _status(a) == "not run yet"
     a._hosts = []  # before discovery: still checking
-    assert _status(a) == "due · checking…"
+    assert _status(a) == "not run yet"
+    assert a._host_state("box") == "checking…"
 
 
 def test_ask_done_hands_claude_the_finish_instruction_separately():
@@ -2562,7 +2618,7 @@ def test_describe_reads_like_people_talk():
         assert routines.describe(phrase) == said
 
 
-def test_run_history_records_starts_failures_lateness_and_caps():
+def test_run_history_records_starts_failures_and_caps():
     entry = routines.new_entry(0)
     for i in range(10):
         routines.add_run(entry, float(i))
@@ -2570,10 +2626,7 @@ def test_run_history_records_starts_failures_lateness_and_caps():
     assert entry["runs"][0]["start"] == 2.0
     routines.add_run(entry, 20.0, failed=True)
     assert routines.current_run(entry)["start"] == 9.0  # a failed start isn't a run
-    entry["runs"][-2].update(done=10.0, late=True)
-    strip = app._runs_strip(entry)
-    assert strip[-2] == ("✓", app.AMBER) and strip[-1] == ("✕", app.RED)
-    assert app._runs_strip(routines.new_entry(0)) == (("·", "dim"),)
+    assert entry["runs"][-1]["failed"]
 
 
 def test_done_run_fetches_and_keeps_its_outcome():
@@ -2632,10 +2685,19 @@ def test_duplicate_opens_a_paused_copy():
     assert form.routine["name"] == "lit-copy" and form.routine["enabled"] is False
 
 
-def test_when_reads_naturally():
-    now = app.datetime(2026, 2, 10, 9, 0)
-    assert app._when(app.datetime(2026, 2, 10, 9, 40), now) == "in 40m"
-    assert app._when(app.datetime(2026, 2, 10, 12, 0), now) == "in 3h"
-    assert app._when(app.datetime(2026, 2, 10, 22, 0), now) == "today 22:00"
-    assert app._when(app.datetime(2026, 2, 11, 8, 0), now) == "tomorrow 08:00"
-    assert app._when(app.datetime(2026, 2, 13, 8, 0), now) == "Fri 08:00"
+def test_next_run_shows_the_date():
+    assert app._when(app.datetime(2026, 2, 13, 8, 0)) == "Fri 13 Feb 08:00"
+    assert app._when(app.datetime(2026, 2, 10, 9, 40)) == "Tue 10 Feb 09:40"
+
+
+def test_routines_columns_line_up_with_the_sessions_columns():
+    def starts(widths):
+        out, x = [], 0
+        for w in widths:
+            out.append(x)
+            x += w + 2  # each cell has 1 column of padding on both sides
+        return out
+
+    sessions = starts(w for _, _, w in app.SESSION_COLUMNS)
+    routines = starts(app._span_width(keys) for _, _, keys in app.ROUTINE_COLUMNS)
+    assert set(routines) <= set(sessions)
