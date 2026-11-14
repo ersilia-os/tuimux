@@ -33,7 +33,8 @@ FIELDS = (
 )
 
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-HISTORY = 8  # runs remembered per routine (the RUNS strip in the panel)
+_DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+HISTORY = 8  # runs remembered per routine (listed in the panel's card)
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -234,7 +235,6 @@ def describe(text):
         return f"Daily · {at}"
     if s.days == frozenset(range(5)):
         return f"Weekdays · {at}"
-    names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     if len(s.days) == 1:
         (d,) = s.days
         full = [
@@ -247,9 +247,28 @@ def describe(text):
             "Sundays",
         ][d]
         return f"{full} · {at}"
-    days = [names[d] for d in sorted(s.days)]
+    days = [_DAY_NAMES[d] for d in sorted(s.days)]
     joined = ", ".join(days[:-1]) + " & " + days[-1]
     return f"{joined} · {at}"
+
+
+def short(text):
+    """A schedule phrase in a few characters: "Mon 09:00", "daily 08:00",
+    "every 6h". Returns the phrase unchanged if it doesn't parse."""
+    try:
+        s = parse(text)
+    except ValueError:
+        return text
+    at = f"{s.hh:02d}:{s.mm:02d}"
+    if s.kind == "every":
+        return " ".join(text.lower().split())
+    if s.kind == "monthly":
+        return f"monthly {s.dom} {at}"
+    if s.days == frozenset(range(7)):
+        return f"daily {at}"
+    if s.days == frozenset(range(5)):
+        return f"weekdays {at}"
+    return ",".join(_DAY_NAMES[d] for d in sorted(s.days)) + f" {at}"
 
 
 def session_name(name):
@@ -380,7 +399,6 @@ def _run(x):
     return {
         "start": float(x.get("start") or 0),
         "done": None if done is None else float(done),
-        "late": bool(x.get("late", False)),
         "failed": bool(x.get("failed", False)),
         "outcome": x.get("outcome") or None,
     }

@@ -27,6 +27,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import (
     Checkbox,
     DataTable,
@@ -72,11 +73,69 @@ SHELLS = {
     "",
 }
 
-VIOLET = "#b08cff"  # agent
-AMBER = "#e0af68"  # awake / waiting / no-ssh
-GREEN = "#9ece6a"  # active session / running / working
-MUTED = "#565f89"  # gray (offline status dot)
-RED = "#f7768e"  # a routine that failed / can't run
+# A graphite palette: greys everywhere, colour only where it means something.
+AGENT = "#8fa8d0"  # an AI agent (claude) in a session's tabs
+AMBER = "#e5c07b"  # awake / waiting / no-ssh
+GREEN = "#98c379"  # active session / running / working
+MUTED = "#5c6370"  # gray (offline status dot)
+RED = "#e06c75"  # a routine that failed / can't run
+STEEL = "#6c8ebf"  # focus: the focused panel's frame, the cursor
+
+THEME = Theme(
+    name="tuimux",
+    primary=STEEL,
+    secondary="#8b929e",
+    accent=STEEL,
+    foreground="#d7dae0",
+    background="#16181c",
+    surface="#1b1e23",
+    panel="#23272e",
+    success=GREEN,
+    warning=AMBER,
+    error=RED,
+    dark=True,
+)
+
+# The sessions table's columns (key, header, width). Fixed widths, sized to
+# the widest realistic content in each column so the table reads as evenly
+# distributed (and the separator rule lines up):
+#   NAME    dot + hostname; longest real name ~23, sub-login rows a bit more
+#   STATUS  fixed words; longest is "checking…" (9)
+#   STATE   session state / "☕ awake" / last-seen ("2h ago")
+#   UPTIME  values are tiny ("2d"); the header sets the floor
+#   FOLDER  a short basename on session rows, doubling as the machine hint
+#           ("tailscale up --ssh", "no account · press u")
+#   TABS    "N  <active-cmd>"
+#   OPEN IN longest is "lost — not restored" (19)
+#   OWNER   "miquel@" / "tag:dev"        SSH USER  "mduranfrigola"
+SESSION_COLUMNS = (
+    ("name", "NAME", 26),
+    ("status", "STATUS", 9),
+    ("state", "STATE", 10),  # fits the animated "running…"
+    ("uptime", "UPTIME", 6),
+    ("folder", "FOLDER", 20),
+    ("tabs", "TABS", 13),
+    ("open", "OPEN IN", 20),
+    ("owner", "OWNER", 10),
+    ("user", "SSH USER", 14),
+)
+
+
+def _span_width(keys):
+    """The width of a column that spans these sessions columns exactly (each
+    DataTable cell has 1 column of padding on both sides)."""
+    widths = dict((k, w) for k, _, w in SESSION_COLUMNS)
+    return sum(widths[k] for k in keys) + 2 * (len(keys) - 1)
+
+
+# The routines table's columns, each spanning whole sessions columns, so every
+# routines column starts exactly where a sessions column does.
+ROUTINE_COLUMNS = (
+    ("name", "ROUTINE", ("name",)),
+    ("schedule", "SCHEDULE", ("status", "state")),
+    ("status", "THIS RUN", ("uptime", "folder")),
+    ("next", "NEXT", ("tabs", "open")),
+)
 
 
 def _marker(state):
@@ -146,6 +205,7 @@ PEEK_DEBOUNCE = 0.12
 # After a routine fails to start (e.g. its computer's disk is full), wait this
 # long before the scheduler tries again — rather than on every probe.
 ROUTINE_RETRY = 300
+EARLIER_RUNS = 4  # past runs listed in the card under the routines table
 # What the bottom panel can show, in the order `v` cycles through them.
 PANELS = ("preview", "routines", "none")
 # Last-known hosts + sessions, saved on exit and shown (dimmed) at the next launch
@@ -273,21 +333,9 @@ def _ago(secs):
     return f"{secs // 86400}d ago"
 
 
-def _when(t, now):
-    """When a future datetime is: "in 45m", "in 3h", "tomorrow 08:00",
-    "Mon 09:00" or "Nov 03"."""
-    secs = (t - now).total_seconds()
-    if secs < 3600:
-        return f"in {max(int(secs // 60), 1)}m"
-    if secs < 12 * 3600:
-        return f"in {int(secs // 3600)}h"
-    if t.date() == now.date():
-        return t.strftime("today %H:%M")
-    if (t.date() - now.date()).days == 1:
-        return t.strftime("tomorrow %H:%M")
-    if secs < 6 * 86400:
-        return t.strftime("%a %H:%M")
-    return t.strftime("%b %d")
+def _when(t):
+    """A routine's next run as a date and time: "Fri 13 Nov 08:00"."""
+    return t.strftime("%a %-d %b %H:%M")
 
 
 def host_read(kind, host, login, *args):
@@ -640,66 +688,96 @@ def load_snapshot(path):
 
 
 def _routine_detail(r, entry=None, failed="", now=None):
-    """The card under the routines table: three quiet lines.
+    """The card under the routines table: two quiet lines.
 
-    When and where it runs; the prompt on one line (long ones cut with "…");
-    and how its last run went — or why it couldn't start.
+    What it runs (schedule, folder, the prompt on one line), then how the
+    latest run went and the dates of the ones before it.
     """
     now = now or time.time()
     entry = entry or {}
     body = Text(no_wrap=True, overflow="ellipsis")
-    body.append(f"{routines.describe(r['schedule'])}  ·  {r['folder']}", "dim")
-    if r.get("ask_done", True):
-        body.append("  ·  asks when finished", "dim")
-    if not r["enabled"]:
-        body.append("  ·  paused", "dim")
-    body.append("\n")
+    body.append(f"{routines.describe(r['schedule'])}  ·  {r['folder']}  ·  ", "dim")
     body.append(
         "  ↵  ".join(ln.strip() for ln in r["prompt"].splitlines() if ln.strip())
     )
+    if not r["enabled"]:
+        body.append("  ·  paused", "dim")
     body.append("\n")
     run = routines.current_run(entry)
     if failed:
-        body.append(f"last start failed: {failed}", AMBER)
+        body.append(f"couldn't start: {failed}", AMBER)
     elif run is None:
-        body.append("not run yet", "dim italic")
+        body.append("never run", "dim italic")
     elif run["done"] is None:
-        body.append(f"started {_ago(now - run['start'])}  ·  not done yet", "dim")
+        body.append(f"started {_ago(now - run['start'])}, not done yet", "dim")
     else:
-        what = run["outcome"] or "no outcome noted"
         body.append("last outcome: ", "dim")
-        body.append(what, "" if run["outcome"] else "dim italic")
         body.append(
-            f"  ·  {_ago(now - run['done'])}  ·  took {_took(run['done'] - run['start'])}",
-            "dim",
+            run["outcome"] or "none noted", "" if run["outcome"] else "dim italic"
         )
+        body.append(f"  ·  took {_took(run['done'] - run['start'])}", "dim")
+    earlier = list(reversed(entry.get("runs", [])[:-1]))[:EARLIER_RUNS]
+    if earlier:
+        body.append("  ·  earlier: ", "dim")
+        for i, x in enumerate(earlier):
+            if i:
+                body.append(" ", "dim")
+            if x["failed"]:
+                body.append("✕", RED)
+            elif x["done"] is not None:
+                body.append("✓", GREEN)
+            else:
+                body.append("●", "dim")
+            body.append(datetime.fromtimestamp(x["start"]).strftime(" %-d %b"), "dim")
     return body
 
 
-def _runs_strip(entry, live_color=""):
-    """One glyph per remembered run, oldest first: ✓ done (amber if it ran late),
-    ✕ couldn't start, ● still open (in its status colour); · when none yet."""
-    runs = entry.get("runs", []) if entry else []
-    if not runs:
-        return (("·", "dim"),)
-    out = []
-    for run in runs:
-        if run["failed"]:
-            out.append(("✕", RED))
-        elif run["done"] is not None:
-            out.append(("✓", AMBER if run["late"] else GREEN))
-        else:
-            out.append(("●", live_color))
-    return tuple(out)
+def _routine_groups(rlist, hosts):
+    """Routines grouped by computer, in display order.
+
+    Parameters
+    ----------
+    rlist : list of dict
+        The routines, in registry order (kept within each group).
+    hosts : list of tuple
+        The discovered host rows; computers follow their order here, and
+        computers not in the tailnet come last.
+
+    Returns
+    -------
+    list of tuple
+        ``[(host, [routine, ...]), ...]``, only computers that have routines.
+    """
+    order = list(dict.fromkeys(h[0] for h in hosts))
+    groups = {}
+    for r in rlist:
+        groups.setdefault(r["host"], []).append(r)
+    known = [h for h in order if h in groups]
+    unknown = [h for h in groups if h not in order]
+    return [(h, groups[h]) for h in known + unknown]
+
+
+def _keep_cursor(old_meta, meta, prev):
+    """Where the routines cursor goes after a redraw: the same row if it's
+    still there, else the first routine (never parked on a header if avoidable)."""
+    if 0 <= prev < len(old_meta) and old_meta[prev] in meta:
+        return meta.index(old_meta[prev])
+    return next((i for i, m in enumerate(meta) if m[0] == "routine"), 0)
+
+
+def _pending_note(pending):
+    """ "1 waiting · 2 unopened" from ``{word: count}``; empty if nothing."""
+    return "  ·  ".join(f"{n} {word}" for word, n in pending.items())
 
 
 def _routine_summary(total, pending):
-    """The routines panel's border note: how many, and how many want you."""
+    """The routines panel's border note: how many, and which open runs wait on
+    you (``{word: count}``, e.g. ``{"waiting": 1}``)."""
     if not total:
         return ""
     note = f"{total} routine{'' if total == 1 else 's'}"
     if pending:
-        note += f"  ·  [bold {AMBER}]{pending} need{'s' if pending == 1 else ''} you[/]"
+        note += f":  [bold {AMBER}]{_pending_note(pending)}[/]"
     return note
 
 
@@ -711,48 +789,52 @@ def _routine_status(
     due,
     live,
     probed,
+    done_ago=None,
     failed=False,
     launching=False,
     opened=False,
-    done=False,
     tick=0,
 ):
-    """Where one routine's run stands.
+    """Where the run for the current period stands (the THIS RUN column).
+
+    `done_ago` is how long ago the latest run finished ("2d ago"), or None if
+    it hasn't. When nothing is due, a finished latest run is this period's.
 
     Returns
     -------
     tuple
-        ``(dot, word, color, pending)``. `pending` means it wants you: it
-        blinks, and counts toward the badge shown outside the routines view.
+        ``(word, color, pending)``. An open run uses the sessions table's
+        words (running, waiting, idle), plus "unopened" until you first join
+        it. `pending` means that open run waits on you (to answer, open or
+        close it): it blinks, and is counted on the panels' borders.
     """
     if sess is not None:  # a run is open on its computer
         if due:  # the next run is owed but this one was never finished
-            return ("●", "overdue", AMBER, True)
+            return ("overdue", AMBER, True)
         if not sess["agent"]:
-            return ("✕", "shell only", RED, True)  # claude didn't start in it
+            return ("no claude", RED, True)  # claude didn't start in it
         st = sess["state"]
-        if st == "waiting":
-            return ("●", "waiting", AMBER, True)
         if st in ("running", "working"):
-            return ("●", "running" + "." * (tick % 4), GREEN, False)
-        if not opened:
-            return ("●", "ready", AMBER, True)  # finished its start, not joined yet
-        return ("●", "not done", "", False)
+            return ("running" + "." * (tick % 4), GREEN, False)
+        if st == "waiting":  # claude asked you something
+            return ("waiting", AMBER, True)
+        if not opened:  # started, and you haven't looked at it yet
+            return ("unopened", AMBER, True)
+        return ("idle", "", False)
     if not sched_ok:
-        return ("✕", "bad schedule", RED, False)
+        return ("bad schedule", RED, False)
     if not enabled:
-        return ("⏸", "paused", "dim", False)
+        return ("paused", "dim", False)
     if failed:
-        return ("✕", "start failed", RED, True)
+        return ("failed", RED, False)  # retried; the card says why
     if launching or (due and live):
-        return ("●", "starting…", GREEN, False)
+        return ("starting", GREEN, False)
     if due:
-        if probed:
-            return ("◌", "due · offline", AMBER, True)
-        return ("◌", "due · checking…", "dim italic", False)
-    if done:
-        return ("✓", "done", GREEN, False)
-    return ("○", "scheduled", "dim", False)
+        # its computer is off (amber), or still being checked (dim)
+        return ("not run yet", AMBER if probed else "dim", False)
+    if done_ago:
+        return (f"done {done_ago}", GREEN, False)
+    return ("not yet", "dim", False)
 
 
 # Table columns in display order. A "cell" is a tuple of (text, style) segments
@@ -1073,16 +1155,25 @@ class Tuimux(App):
     COMMAND_PALETTE_BINDING = "p"  # open the command palette with p (not ctrl+p)
     CSS = """
     Screen { background: $surface; }
-    #table-wrap {
-        border: round $primary 25%;
-        border-title-color: $primary 70%;
+    /* Every panel sits on one grid: the same margins, padding, frame and title
+       placement, so their columns line up. Frames are quiet grey; only the
+       focused panel's frame takes the accent. */
+    #table-wrap, #preview, #routines-wrap {
+        border: round $foreground 12%;
+        border-title-color: $foreground 55%;
         border-title-style: bold;
-        border-title-align: center;
+        border-title-align: left;
         border-subtitle-color: $text-muted;
         border-subtitle-align: right;
-        padding: 1 2;
-        margin: 1 2;
-        height: 3fr;
+        padding: 1 2 0 2;
+        margin: 0 2 1 2;
+    }
+    #table-wrap { height: 3fr; margin: 1 2 1 2; }
+    #preview, #routines-wrap { height: 2fr; }
+    #preview { background: $surface; color: $text; overflow: hidden; }
+    #table-wrap:focus-within, #routines-wrap:focus-within {
+        border: round $primary 70%;
+        border-title-color: $foreground;
     }
     /* Tables sit flat on their panel: no fill, no focus tint, no header band,
        no hover band. Focus shows on the panel's frame instead (focus-within),
@@ -1092,49 +1183,21 @@ class Tuimux(App):
     DataTable:focus { background-tint: $foreground 0%; }
     DataTable > .datatable--header,
     DataTable:focus > .datatable--header {
-        color: $text-muted; text-style: bold;
+        color: $foreground 45%; text-style: bold;
         background: transparent; background-tint: $foreground 0%;
     }
     DataTable > .datatable--cursor { background: transparent; text-style: none; }
-    DataTable:focus > .datatable--cursor { background: $primary 15%; text-style: none; }
+    DataTable:focus > .datatable--cursor { background: $primary 18%; text-style: none; }
     DataTable > .datatable--hover { background: transparent; }
-    #table-wrap:focus-within, #routines-wrap:focus-within {
-        border: round $primary 70%;
-        border-title-color: $primary;
-    }
-    #preview {
-        height: 2fr;
-        margin: 0 2 1 2;
-        padding: 0 1;
-        border: round $primary 25%;
-        border-title-color: $primary 70%;
-        border-title-style: bold;
-        border-title-align: left;
-        background: $surface;
-        color: $text;
-        overflow: hidden;
-    }
-    #routines-wrap {
-        border: round $primary 25%;
-        border-title-color: $primary 70%;
-        border-title-style: bold;
-        border-title-align: left;
-        border-subtitle-color: $text-muted;
-        border-subtitle-align: right;
-        padding: 0 2;
-        margin: 0 2 1 2;
-        height: 2fr;
-    }
-    #routines-wrap DataTable { height: 1fr; }
     #routine-detail {
-        height: 4; padding: 0 1; color: $text-muted;  /* the rule + 3 lines */
-        border-top: solid $primary 15%;
+        height: 4; padding: 1 1 0 1; color: $text-muted;  /* rule, gap, 2 lines */
+        border-top: solid $foreground 8%;
     }
     #form {
         width: 92; height: auto; padding: 1 3; margin: 1;
-        background: $panel; border: round $primary 60%;
+        background: $panel; border: round $foreground 20%;
     }
-    #form-title { color: $primary; text-style: bold; padding: 0 0 1 0; }
+    #form-title { color: $foreground; text-style: bold; padding: 0 0 1 0; }
     #form .row { height: auto; }
     #form .col { width: 1fr; height: auto; }
     #form .col:first-of-type { margin-right: 2; }
@@ -1145,7 +1208,7 @@ class Tuimux(App):
     #form-keys { color: $text-muted; margin-top: 1; }
     #dialog {
         width: 56; height: auto; padding: 1 2; margin: 1;
-        background: $panel; border: round $primary;
+        background: $panel; border: round $foreground 20%;
     }
     #dialog-msg { width: 1fr; padding: 0 0 1 0; content-align: center middle; }
     #dialog-input { margin-top: 1; }
@@ -1154,7 +1217,7 @@ class Tuimux(App):
         background: $panel; padding: 0;
     }
     #menu-list > .option-list--option { padding: 0 1; }
-    #menu-list > .option-list--option-highlighted { background: $primary 25%; }
+    #menu-list > .option-list--option-highlighted { background: $primary 20%; }
     ModalScreen { align: center middle; background: $background 70%; }
     """
 
@@ -1216,6 +1279,7 @@ class Tuimux(App):
         # routines: the registry, run state, names being launched right now, the
         # registry's mtime (to pick up hand edits), and the panel's last paint
         self._routines = []
+        self._rmeta = []  # per routines-table row: ("host", name) or ("routine", name)
         self._rstate = {}
         self._launching = set()
         # name -> (monotonic time, reason) of a failed start, for the retry backoff
@@ -1342,48 +1406,15 @@ class Tuimux(App):
                 severity="warning",
                 timeout=12,
             )
-        for theme in ("tokyo-night", "catppuccin-mocha", "nord"):
-            try:
-                self.theme = theme
-                break
-            except Exception:
-                continue
+        self.register_theme(THEME)
+        self.theme = THEME.name
         t = self._table = self.query_one(SessionTable)
-        # Fixed widths, sized to the widest realistic content in each column so the
-        # table reads as evenly distributed (and the separator rule lines up):
-        #   NAME    dot + hostname; longest real name ~23, sub-login rows a bit more
-        #   STATUS  fixed words; longest is "checking…" (9)
-        #   STATE   session state / "☕ awake" / last-seen ("2h ago")
-        #   UPTIME  values are tiny ("2d"); the header sets the floor
-        #   FOLDER  a short basename on session rows, doubling as the machine hint
-        #           ("tailscale up --ssh", "no account · press u")
-        #   TABS    "N  <active-cmd>"
-        #   OPEN IN longest is "lost — not restored" (19)
-        #   OWNER   "miquel@" / "tag:dev"        SSH USER  "mduranfrigola"
-        for col, key, w in (
-            ("NAME", "name", 26),
-            ("STATUS", "status", 9),
-            ("STATE", "state", 10),  # fits the animated "running…"
-            ("UPTIME", "uptime", 6),
-            ("FOLDER", "folder", 20),
-            ("TABS", "tabs", 13),
-            ("OPEN IN", "open", 20),
-            ("OWNER", "owner", 10),
-            ("SSH USER", "user", 14),
-        ):
+        for key, col, w in SESSION_COLUMNS:
             t.add_column(col, key=key, width=w)
         t.focus()
         r = self._rtable = self.query_one(RoutineTable)
-        for col, key, w in (
-            ("ROUTINE", "name", 24),
-            ("COMPUTER", "host", 20),
-            ("SCHEDULE", "schedule", 22),
-            ("NEXT", "next", 15),
-            ("RUNS", "runs", 10),
-            ("LAST RUN", "last", 10),
-            ("STATUS", "status", 18),
-        ):
-            r.add_column(col, key=key, width=w)
+        for key, col, spans in ROUTINE_COLUMNS:
+            r.add_column(col, key=key, width=_span_width(spans))
         self._load_routines()
         self._preview = self.query_one("#preview", Static)
         self._set_preview_idle()
@@ -1444,8 +1475,7 @@ class Tuimux(App):
             pending = self._pending_routines(time.time())
         note = self._status_note
         if pending and self._panel != "routines":
-            what = "routine needs" if pending == 1 else "routines need"
-            badge = f"[blink bold {AMBER}]● {pending} {what} you (v)[/]"
+            badge = f"[blink bold {AMBER}]routines: {_pending_note(pending)} (v)[/]"
             note = f"{badge}  ·  {note}" if note else badge
         wrap.border_subtitle = note
 
@@ -1657,7 +1687,7 @@ class Tuimux(App):
         else:
             # Title updates immediately, with the last capture of this session if
             # we have one; a fresh capture replaces it once the cursor rests.
-            self._preview.border_title = f" {key[2]} · {key[0]} "
+            self._preview.border_title = f"{key[2]} · {key[0]}"
             if key in self._peek_cache:
                 self._paint_preview(self._peek_cache[key])
             else:
@@ -1692,7 +1722,7 @@ class Tuimux(App):
         self._preview.update(Text.from_ansi("\n".join(lines)))
 
     def _set_preview_idle(self):
-        self._preview.border_title = " preview "
+        self._preview.border_title = "preview"
         self._preview.update(
             Text("  Move to a session to preview its output.", style="dim italic")
         )
@@ -1791,13 +1821,13 @@ class Tuimux(App):
     @staticmethod
     def _tabs_cell(tabs):
         """TABS reads "<count>  <active-cmd>", or just "<active-cmd>" for a lone
-        window (no count prefix). Tint the command violet when the active window is
+        window (no count prefix). Tint the command blue when the active window is
         an AI agent (its command contains "claude")."""
         head, sep, cmd = tabs.partition("  ")
         if not sep:  # single window → the whole cell is the active command
-            return ((tabs, VIOLET),) if "claude" in tabs.lower() else ((tabs, "dim"),)
+            return ((tabs, AGENT),) if "claude" in tabs.lower() else ((tabs, "dim"),)
         if "claude" in cmd.lower():
-            return ((head + sep, "dim"), (cmd, VIOLET))
+            return ((head + sep, "dim"), (cmd, AGENT))
         return ((tabs, "dim"),)
 
     # Build the table as plain data — a list of (cells, meta) rows — so we can
@@ -1812,7 +1842,7 @@ class Tuimux(App):
     #            else is bold — not the STATUS word, not session names.
     #   amber  → the one thing that wants you: an agent STATE of "waiting" (plus
     #            keep-awake / no-ssh markers). Kept rare so it actually pops.
-    #   violet → "claude" inside the TABS column (the active window is an AI agent).
+    #   blue → "claude" inside the TABS column (the active window is an AI agent).
     #   dim    → everything else: metadata (folder, tabs, uptime, OPEN IN, USER),
     #            idle/transient sessions, offline/"checking…" machines, hints.
     def _view(self):
@@ -2442,6 +2472,7 @@ class Tuimux(App):
             sched = None
         entry = self._rstate.get(r["name"]) or routines.new_entry(now)
         due = bool(sched) and routines.is_due(sched, routines.base_time(entry), now)
+        run = routines.current_run(entry)
         status = _routine_status(
             sched_ok=sched is not None,
             enabled=r["enabled"],
@@ -2449,10 +2480,10 @@ class Tuimux(App):
             due=due and r["enabled"],
             live=bool(info and info.get("reachable") and not info.get("stale")),
             probed=bool(info and not info.get("stale")) or self._host_down(r["host"]),
+            done_ago=_ago(now - run["done"]) if run and run["done"] else None,
             failed=r["name"] in self._failed,
             launching=r["name"] in self._launching,
             opened=entry.get("opened", False),
-            done=bool(entry.get("done") and entry.get("last")),
             tick=self._tick,
         )
         return sched, entry, due, status
@@ -2471,8 +2502,7 @@ class Tuimux(App):
 
     def _routine_row(self, r, now):
         """The cells of one routine's row (pure: reads state, starts nothing)."""
-        sched, entry, due, (dot, word, color, pending) = self._routine_state(r, now)
-        accent = self._host_accent(r["host"]) if r["enabled"] else "dim"
+        sched, entry, due, (word, color, pending) = self._routine_state(r, now)
         flash = f"blink bold {color}" if pending else color
         if sched is None or not r["enabled"]:
             nxt = ("—", "dim")
@@ -2482,20 +2512,45 @@ class Tuimux(App):
             nowdt = datetime.fromtimestamp(now)
             t = routines.next_slot(sched, nowdt, routines.base_time(entry))
             soon = (t - nowdt).total_seconds() < 3600
-            nxt = (_when(t, nowdt), "" if soon else "dim")
-        last = entry.get("last")
+            nxt = (_when(t), "" if soon else "dim")
         return (
-            ((dot + " ", flash), (r["name"], accent)),
-            ((r["host"], accent),),
-            ((routines.describe(r["schedule"]), "dim"),),
-            (nxt,),
-            _runs_strip(entry, color),
-            (((_ago(now - last) if last else "never"), "dim"),),
+            (("  ", ""), (r["name"], "" if r["enabled"] else "dim")),
+            ((routines.short(r["schedule"]), "dim"),),
             ((word, flash),),
+            (nxt,),
+        )
+
+    def _host_state(self, host):
+        """ "online", "offline" or "checking…" for a computer, from its probes."""
+        infos = [v for (h, _), v in self._results.items() if h == host]
+        if any(i.get("reachable") and not i.get("stale") for i in infos):
+            return "online"
+        if self._host_down(host) or any(
+            not i.get("reachable") and not i.get("stale") for i in infos
+        ):
+            return "offline"
+        return "checking…"
+
+    def _host_header_row(self, host):
+        """The cells of a computer's header row in the routines table."""
+        state = self._host_state(host)
+        accent = self._host_accent(host)
+        dot = _marker({"online": "up", "offline": "offline"}.get(state, "checking"))
+        return (
+            (dot, (host, f"bold {accent}".strip())),
+            ((state, AMBER if state == "offline" else "dim"),),
+            (),
+            (),
         )
 
     def _pending_routines(self, now):
-        return sum(1 for r in self._routines if self._routine_state(r, now)[3][3])
+        """Open runs that wait on you, by state: ``{"waiting": 1, ...}``."""
+        out = {}
+        for r in self._routines:
+            word, _color, pending = self._routine_state(r, now)[3]
+            if pending:
+                out[word] = out.get(word, 0) + 1
+        return out
 
     def _render_routines(self):
         t = self._rtable
@@ -2508,12 +2563,24 @@ class Tuimux(App):
         self._refresh_badge(pending)
         # t.parent is the panel: a direct handle that works whichever screen is up
         t.parent.border_subtitle = _routine_summary(len(self._routines), pending)
-        rows = [self._routine_row(r, now) for r in self._routines]
+        rows, meta = [], []
+        for host, group in _routine_groups(self._routines, self._hosts):
+            rows.append(self._host_header_row(host))
+            meta.append(("host", host))
+            for r in group:
+                rows.append(self._routine_row(r, now))
+                meta.append(("routine", r["name"]))
         sig = tuple(rows)
-        if sig == self._last_rsig:
+        old_meta = self._rmeta
+        self._rmeta = meta
+        if sig == self._last_rsig and meta == old_meta:
             return
         prev = t.cursor_row
-        if self._last_rsig is not None and len(self._last_rsig) == len(rows):
+        if (
+            self._last_rsig is not None
+            and len(self._last_rsig) == len(rows)
+            and meta == old_meta
+        ):
             for i, cells in enumerate(rows):
                 for c, cell in enumerate(cells):
                     if cell != self._last_rsig[i][c]:
@@ -2522,16 +2589,23 @@ class Tuimux(App):
             t.clear()
             t.add_rows(tuple(self._cell(c) for c in cells) for cells in rows)
             if rows:
-                t.move_cursor(row=min(max(prev, 0), len(rows) - 1))
+                t.move_cursor(row=_keep_cursor(old_meta, meta, prev))
         self._last_rsig = sig
         if self._panel == "routines":
             self._sync_routine_detail()  # edits, failures and renames show here too
 
-    def _cur_routine(self):
+    def _cur_rmeta(self):
         t = self._rtable
-        if t is not None and 0 <= t.cursor_row < len(self._routines):
-            return self._routines[t.cursor_row]
+        if t is not None and 0 <= t.cursor_row < len(self._rmeta):
+            return self._rmeta[t.cursor_row]
         return None
+
+    def _cur_routine(self):
+        """The routine under the cursor, or None (on a computer's header row)."""
+        kind, name = self._cur_rmeta() or ("", "")
+        if kind != "routine":
+            return None
+        return next((r for r in self._routines if r["name"] == name), None)
 
     def _tick_routines(self):
         if self._table is None or self._modal_open():
@@ -2558,10 +2632,6 @@ class Tuimux(App):
             if not info or not info.get("reachable") or info.get("stale"):
                 continue
             if sess is not None:
-                run = routines.current_run(entry)
-                if run and run["done"] is None and not run["late"]:
-                    run["late"] = True  # its next slot came while it was still open
-                    self._save_state()
                 continue
             self._launching.add(r["name"])
             self._launch(r, login, False)
@@ -2613,6 +2683,20 @@ class Tuimux(App):
     def _sync_routine_detail(self):
         r = self._cur_routine()
         detail = self.query_one("#routine-detail", Static)
+        here = self._cur_rmeta()
+        if r is None and here and here[0] == "host":  # a computer's header row
+            n = sum(1 for x in self._routines if x["host"] == here[1])
+            detail.update(
+                Text.assemble(
+                    (here[1], "bold"),
+                    (f"  ·  {n} routine{'' if n == 1 else 's'}", "dim"),
+                    (f"  ·  {self._host_state(here[1])}\n", "dim"),
+                    ("Press ", "dim"),
+                    ("n", f"bold {AMBER}"),
+                    (" to add one here.", "dim"),
+                )
+            )
+            return
         if r is None:  # nothing yet: say what routines are, and how to start
             detail.update(
                 Text.assemble(
@@ -2728,9 +2812,17 @@ class Tuimux(App):
         return names or ["?"]
 
     def action_routine_new(self):
+        # on a computer's header row, or one of its routines: that computer;
+        # otherwise this one
+        here = self._cur_rmeta()
+        host = _ENV.get("TUIMUX_SELF_HOST", "")
+        if here and here[0] == "host":
+            host = here[1]
+        elif self._cur_routine():
+            host = self._cur_routine()["host"]
         blank = {
             "name": "",
-            "host": _ENV.get("TUIMUX_SELF_HOST", ""),  # this computer by default
+            "host": host,
             "login": "",
             "folder": "~",
             "schedule": "weekly mon 09:00",
@@ -2749,7 +2841,10 @@ class Tuimux(App):
         taken = {x["name"] for x in self._routines}
         self.push_screen(
             RoutineForm(
-                blank, self._compute_hosts(), taken, check_claude=self._check_claude
+                blank,
+                self._compute_hosts(also=host),
+                taken,
+                check_claude=self._check_claude,
             ),
             done,
         )
