@@ -63,10 +63,14 @@ folder = "~/Documents/GitHub/ersilia-skills"
 schedule = "weekly mon 09:00"   # daily 09:00 · weekdays 09:00 · monthly 1 09:00 · every 6h
 enabled = true
 ask_done = true
+mode = "interactive"            # or "unattended"
+allow = ""                      # unattended only, e.g. "Read,Grep,WebFetch,Bash(gh *)"
 prompt = """
 /literature-digest
 """
 ```
+
+**Unattended routines** run `claude -p` instead: Claude asks nothing, the session closes itself when it finishes, and THIS RUN shows `done` or `failed`. Tools outside `allow` (and your `~/.claude/settings.json` allow rules) are denied, and Claude skips those steps. The output is kept in `~/.cache/tuimux/routines/<name>.log`. Use them for skills that need no answers from you.
 
 ## Setup conventions
 

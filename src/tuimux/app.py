@@ -292,6 +292,11 @@ def host_action(kind, host, login, *args):
         _run([_ACTIONS[kind], host, login, *args], timeout=ACTION_TIMEOUT)
 
 
+def _unattended(r):
+    """Whether a routine runs on its own: claude in print mode, no questions."""
+    return r.get("mode") == "unattended"
+
+
 def launch_routine(host, login, r):
     """Start a routine's session on its host.
 
@@ -309,7 +314,17 @@ def launch_routine(host, login, r):
         ``__FAIL__``; anything else means the host couldn't be reached.
     """
     ask = "1" if r.get("ask_done", True) else "0"
-    args = [routines.session_name(r["name"]), r["folder"], r["name"], host, login, ask]
+    alone = "1" if _unattended(r) else "0"
+    args = [
+        routines.session_name(r["name"]),
+        r["folder"],
+        r["name"],
+        host,
+        login,
+        ask,
+        alone,
+        r.get("allow", ""),
+    ]
     if not _persistent(host):
         return _run(
             ["__launch", *args], timeout=ACTION_TIMEOUT, input=r["prompt"]
@@ -700,6 +715,8 @@ def _routine_detail(r, entry=None, failed="", now=None):
     body.append(
         "  ↵  ".join(ln.strip() for ln in r["prompt"].splitlines() if ln.strip())
     )
+    if _unattended(r):
+        body.append("  ·  unattended", "dim")
     if not r["enabled"]:
         body.append("  ·  paused", "dim")
     body.append("\n")
@@ -710,6 +727,11 @@ def _routine_detail(r, entry=None, failed="", now=None):
         body.append("never run", "dim italic")
     elif run["done"] is None:
         body.append(f"started {_ago(now - run['start'])}, not done yet", "dim")
+    elif run.get("exit"):
+        body.append(f"failed (exit {run['exit']})", RED)
+        if run["outcome"]:
+            body.append(f": {run['outcome']}", "dim")
+        body.append(f"  ·  log ~/.cache/tuimux/routines/{r['name']}.log", "dim")
     else:
         body.append("last outcome: ", "dim")
         body.append(
@@ -757,6 +779,21 @@ def _routine_groups(rlist, hosts):
     return [(h, groups[h]) for h in known + unknown]
 
 
+def _parse_outcome(out):
+    """Split the engine's outcome read into ``(line, exit_code)``: the first
+    non-empty line (cut at 200 characters), and the code from an
+    ``__EXIT__ <n>`` line, which only unattended runs write (else None)."""
+    code, line = None, ""
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if ln.startswith("__EXIT__"):
+            tail = ln[len("__EXIT__") :].strip()
+            code = int(tail) if tail.lstrip("-").isdigit() else None
+        elif ln and not line:
+            line = ln[:200]
+    return line, code
+
+
 def _keep_cursor(old_meta, meta, prev):
     """Where the routines cursor goes after a redraw: the same row if it's
     still there, else the first routine (never parked on a header if avoidable)."""
@@ -790,6 +827,8 @@ def _routine_status(
     live,
     probed,
     done_ago=None,
+    exit_code=None,
+    unattended=False,
     failed=False,
     launching=False,
     opened=False,
@@ -799,6 +838,8 @@ def _routine_status(
 
     `done_ago` is how long ago the latest run finished ("2d ago"), or None if
     it hasn't. When nothing is due, a finished latest run is this period's.
+    An `unattended` run never waits on you: while its session is open it is
+    running, and a non-zero `exit_code` marks the finished run as failed.
 
     Returns
     -------
@@ -808,6 +849,8 @@ def _routine_status(
         it. `pending` means that open run waits on you (to answer, open or
         close it): it blinks, and is counted on the panels' borders.
     """
+    if sess is not None and unattended:  # claude -p, until its session closes
+        return ("running" + "." * (tick % 4), GREEN, False)
     if sess is not None:  # a run is open on its computer
         if due:  # the next run is owed but this one was never finished
             return ("overdue", AMBER, True)
@@ -832,6 +875,8 @@ def _routine_status(
     if due:
         # its computer is off (amber), or still being checked (dim)
         return ("not run yet", AMBER if probed else "dim", False)
+    if done_ago and exit_code:
+        return (f"failed {done_ago}", RED, False)  # the card says how
     if done_ago:
         return (f"done {done_ago}", GREEN, False)
     return ("not yet", "dim", False)
@@ -1020,10 +1065,36 @@ class RoutineForm(ModalScreen[dict]):
                 "prompt — usually a skill, e.g. /literature-digest", classes="field"
             )
             yield TextArea(r["prompt"], id="f-prompt")
+            yield Label("mode", classes="field")
+            yield Select(
+                (
+                    (
+                        "interactive — claude waits for you in its session",
+                        "interactive",
+                    ),
+                    (
+                        "unattended — claude runs alone and the run closes itself",
+                        "unattended",
+                    ),
+                ),
+                value=r.get("mode") or "interactive",
+                allow_blank=False,
+                id="f-mode",
+            )
             yield Checkbox(
                 "ask when finished — Claude asks “done?”, and yes closes the run",
                 r.get("ask_done", True),
                 id="f-ask-done",
+            )
+            yield Label(
+                "allow — tools it may use; everything else is denied",
+                classes="field",
+                id="f-allow-label",
+            )
+            yield Input(
+                r.get("allow", ""),
+                placeholder="e.g. Read,Grep,Glob,WebFetch,Bash(gh *)",
+                id="f-allow",
             )
             yield Label("", id="f-error")
             yield Label(
@@ -1035,6 +1106,7 @@ class RoutineForm(ModalScreen[dict]):
         self.query_one("#f-name", Input).focus()
         self._preview_schedule(self.routine["schedule"])
         self._check(str(self.query_one("#f-host", Select).value))
+        self._show_mode(self.routine.get("mode") or "interactive")
 
     def on_input_changed(self, e: Input.Changed) -> None:
         if e.input.id == "f-schedule":
@@ -1043,6 +1115,15 @@ class RoutineForm(ModalScreen[dict]):
     def on_select_changed(self, e: Select.Changed) -> None:
         if e.select.id == "f-host":
             self._check(str(e.value))
+        elif e.select.id == "f-mode":
+            self._show_mode(str(e.value))
+
+    def _show_mode(self, mode):
+        # interactive asks "done?" at the end; unattended needs its allow list
+        alone = mode == "unattended"
+        self.query_one("#f-ask-done", Checkbox).display = not alone
+        self.query_one("#f-allow-label", Label).display = alone
+        self.query_one("#f-allow", Input).display = alone
 
     def _preview_schedule(self, text):
         # Live: when it would next run, or what's wrong with the phrase.
@@ -1112,6 +1193,8 @@ class RoutineForm(ModalScreen[dict]):
             "schedule": " ".join(self.query_one("#f-schedule", Input).value.split()),
             "enabled": self.routine["enabled"],
             "ask_done": self.query_one("#f-ask-done", Checkbox).value,
+            "mode": str(self.query_one("#f-mode", Select).value),
+            "allow": self.query_one("#f-allow", Input).value.strip(),
             "prompt": self.query_one("#f-prompt", TextArea).text.strip("\n"),
         }
         try:
@@ -2481,6 +2564,8 @@ class Tuimux(App):
             live=bool(info and info.get("reachable") and not info.get("stale")),
             probed=bool(info and not info.get("stale")) or self._host_down(r["host"]),
             done_ago=_ago(now - run["done"]) if run and run["done"] else None,
+            exit_code=run.get("exit") if run else None,
+            unattended=_unattended(r),
             failed=r["name"] in self._failed,
             launching=r["name"] in self._launching,
             opened=entry.get("opened", False),
@@ -2750,15 +2835,16 @@ class Tuimux(App):
     @work(thread=True, group="outcome")
     def _fetch_outcome(self, r, login, start):
         out = host_read("outcome", r["host"], login, r["name"]) or ""
-        line = next((ln.strip() for ln in out.splitlines() if ln.strip()), "")
-        if line:
-            self.call_from_thread(self._got_outcome, r["name"], start, line[:200])
+        line, code = _parse_outcome(out)
+        if line or code is not None:
+            self.call_from_thread(self._got_outcome, r["name"], start, line, code)
 
-    def _got_outcome(self, name, start, line):
+    def _got_outcome(self, name, start, line, code=None):
         entry = self._rstate.get(name) or {}
         run = next((x for x in entry.get("runs", []) if x["start"] == start), None)
         if run is not None:
-            run["outcome"] = line
+            run["outcome"] = line or None
+            run["exit"] = code
             self._save_state()
             self._last_rsig = None
             self._request_render()
@@ -2800,7 +2886,7 @@ class Tuimux(App):
             return
         self._launching.add(r["name"])
         self._request_render()
-        self._launch(r, login, True)
+        self._launch(r, login, not _unattended(r))  # unattended: no tab to open
 
     def _compute_hosts(self, also=""):
         names = []
@@ -2828,6 +2914,8 @@ class Tuimux(App):
             "schedule": "weekly mon 09:00",
             "enabled": True,
             "ask_done": True,
+            "mode": "interactive",
+            "allow": "",
             "prompt": "",
         }
 

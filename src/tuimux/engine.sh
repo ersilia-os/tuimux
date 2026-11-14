@@ -601,8 +601,9 @@ remote_script() {
     rename) printf "tmux rename-session -t '%s' '%s'" "${1:-}" "${2:-}" ;;
     awake)  awake_toggle_script ;;
     launch) launch_script "$@" ;;
-    # what the routine's claude wrote about its run (empty if nothing)
-    outcome) printf 'cat "$HOME/.cache/tuimux/routines/%s.outcome" 2>/dev/null; true' "${1:-}" ;;
+    # what the routine's claude wrote about its run (empty if nothing), after an
+    # "__EXIT__ <code>" line when it ran unattended
+    outcome) printf 'd="$HOME/.cache/tuimux/routines"; [ -f "$d/%s.exit" ] && printf "__EXIT__ %%s\\n" "$(cat "$d/%s.exit")"; cat "$d/%s.outcome" 2>/dev/null; true' "${1:-}" "${1:-}" "${1:-}" ;;
     claude_check) claude_check_script ;;
     # the ssh options, one per line, so the dashboard's shells honour the config
     sshopts) printf '%s\n' "${SSH_OPTS[@]}" ;;
@@ -1140,11 +1141,15 @@ sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # newlines in it survive untouched. Prints __LAUNCHED__, __EXISTS__, or
 # "__FAIL__ <reason>" — then nothing was started (e.g. the prompt couldn't be
 # written because the disk is full: claude must never start without it).
-# Args: <session> <folder> <name> <host> <login> [ask_done]; <name> is a slug.
-# With ask_done=1 claude also gets done_instruction (via --append-system-prompt,
-# so a skill prompt like "/literature-digest" stays exactly as written).
+# Args: <session> <folder> <name> <host> <login> [ask_done] [unattended] [allow];
+# <name> is a slug. With ask_done=1 claude also gets done_instruction (via
+# --append-system-prompt, so a skill prompt like "/literature-digest" stays
+# exactly as written). With unattended=1 claude runs in print mode instead (see
+# unattended_run): nobody is asked anything, tools outside <allow> are denied,
+# and the session closes itself when claude is done.
 launch_script() {
   local session="$1" folder="$2" name="$3" host="$4" login="$5" ask="${6:-0}"
+  local unattended="${7:-0}" allow="${8:-}"
   local prompt delim dir pfile dfile done_text="" write_done="" claude_cmd
   prompt="$(cat)"
   delim="TUIMUX_PROMPT_$RANDOM$RANDOM"
@@ -1164,9 +1169,16 @@ $done_text
 TUIMUX_DONE_TEXT"
     claude_cmd="claude --append-system-prompt \"\$(cat \"$dfile\")\" \"\$(cat \"$pfile\")\""
   fi
+  if [ "$unattended" = 1 ]; then
+    write_done="cat > \"\$HOME/.cache/tuimux/routines/$name.run.sh\" <<'TUIMUX_RUN_SCRIPT' || { echo \"__FAIL__ couldn't write the prompt file (disk full?)\"; exit 0; }
+$(unattended_run "$name" "$allow")
+TUIMUX_RUN_SCRIPT"
+    # sh runs it whatever the login shell is; exit closes the session after it
+    claude_cmd="sh \"\$HOME/.cache/tuimux/routines/$name.run.sh\"; exit"
+  fi
   cat <<EOF
 if tmux has-session -t $(sh_quote "=$session") 2>/dev/null; then echo __EXISTS__; exit 0; fi
-rm -f "\$HOME/.cache/tuimux/routines/$name.outcome"  # a fresh run, a fresh outcome
+rm -f "\$HOME/.cache/tuimux/routines/$name.outcome" "\$HOME/.cache/tuimux/routines/$name.exit"  # a fresh run, a fresh outcome
 mkdir -p "\$HOME/.cache/tuimux/routines" && cat > "$pfile" <<'$delim' || { echo "__FAIL__ couldn't write the prompt file (disk full?)"; exit 0; }
 $prompt
 $delim
@@ -1190,6 +1202,34 @@ claude_check_script() {
   [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; exit 0; }
 done
 echo __NONE__'
+}
+
+# The script an unattended run executes (POSIX sh, written next to the prompt):
+# claude in print mode, denying every tool outside <allow>, its output shown in
+# the session and kept in <name>.log; then its exit code and last line go to
+# <name>.exit and <name>.outcome for tuimux to read. Args: <name> <allow>.
+unattended_run() {
+  local name="$1" allow="$2" tools=""
+  [ -n "$allow" ] && tools=" --allowedTools $(sh_quote "$allow")"
+  cat <<EOF
+d="\$HOME/.cache/tuimux/routines"
+echo "tuimux routine $name: unattended, started \$(date +%H:%M). Log: \$d/$name.log"
+{
+  claude -p "\$(cat "\$d/$name.prompt")" --permission-mode dontAsk$tools \\
+    --append-system-prompt "$(unattended_instruction "$name")"
+  echo \$? > "\$d/$name.exit"
+} 2>&1 | tee "\$d/$name.log"
+grep -v '^[[:space:]]*\$' "\$d/$name.log" | tail -n 1 | cut -c1-200 > "\$d/$name.outcome"
+EOF
+}
+
+# What an unattended routine's claude is told: nobody is there to answer.
+unattended_instruction() {
+  printf '%s ' \
+    "This is the tuimux routine \\\"$1\\\", running unattended on a schedule: nobody will read or answer questions until it has finished." \
+    "Never ask the user anything; make sensible choices and note them." \
+    "If a tool is denied, skip that step and say so." \
+    "End your final message with ONE short line saying what this run produced (e.g. \\\"12 new papers, 3 flagged for the Hub\\\")."
 }
 
 # What a routine's claude is told about finishing: ask, and on "yes" close its
