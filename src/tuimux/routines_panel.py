@@ -13,7 +13,6 @@ from textual.widgets import (
 
 from . import routines
 from .fmt import (
-    _ago,
     _when,
 )
 from .hosts import (
@@ -116,12 +115,14 @@ class RoutinesPanel:
             due=due and r["enabled"],
             live=bool(info and info.get("reachable") and not info.get("stale")),
             probed=bool(info and not info.get("stale")) or self._host_down(r["host"]),
-            done_ago=_ago(now - run["done"]) if run and run["done"] else None,
+            since=run["start"] if run else None,
+            done_at=run["done"] if run else None,
             exit_code=run.get("exit") if run else None,
             unattended=_unattended(r),
             failed=r["name"] in self._failed,
             launching=r["name"] in self._launching,
             opened=entry.get("opened", False),
+            now=now,
             tick=self._tick,
         )
         return sched, entry, due, status
@@ -140,8 +141,7 @@ class RoutinesPanel:
 
     def _routine_row(self, r, now):
         """The cells of one routine's row (pure: reads state, starts nothing)."""
-        sched, entry, due, (word, color, pending) = self._routine_state(r, now)
-        flash = f"blink bold {color}" if pending else color
+        sched, entry, due, (word, style, _todo) = self._routine_state(r, now)
         if sched is None or not r["enabled"]:
             nxt = ("—", "dim")
         elif due:
@@ -154,7 +154,7 @@ class RoutinesPanel:
         return (
             (("  ", ""), (r["name"], "" if r["enabled"] else "dim")),
             ((routines.short(r["schedule"]), "dim"),),
-            ((word, flash),),
+            ((word, style),),
             (nxt,),
             (("unattended", "") if _unattended(r) else ("interactive", "dim"),),
         )
@@ -191,12 +191,12 @@ class RoutinesPanel:
         )
 
     def _pending_routines(self, now):
-        """Open runs that wait on you, by state: ``{"waiting": 1, ...}``."""
+        """Open runs that wait on you, by what for: ``{"to answer": 1, ...}``."""
         out = {}
         for r in self._routines:
-            word, _color, pending = self._routine_state(r, now)[3]
-            if pending:
-                out[word] = out.get(word, 0) + 1
+            todo = self._routine_state(r, now)[3][2]
+            if todo:
+                out[todo] = out.get(todo, 0) + 1
         return out
 
     def _render_routines(self):

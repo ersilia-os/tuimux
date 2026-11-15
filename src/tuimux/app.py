@@ -342,7 +342,9 @@ class Tuimux(
             pending = self._pending_routines(time.time())
         note = self._status_note
         if pending and self._panel != "routines":
-            badge = f"[blink bold {AMBER}]routines: {_pending_note(pending)} (v)[/]"
+            # blink only when Claude is stuck on a question (as the row does)
+            style = f"blink bold {AMBER}" if "to answer" in pending else f"bold {AMBER}"
+            badge = f"[{style}]routines: {_pending_note(pending)} (v)[/]"
             note = f"{badge}  ·  {note}" if note else badge
         wrap.border_subtitle = note
 

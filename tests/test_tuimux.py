@@ -2402,35 +2402,67 @@ def _status(a):
 
 def test_routine_status_lifecycle():
     agent = lambda st: {**_live("routine-lit"), "agent": True, "state": st}  # noqa: E731
+    now = datetime(2026, 11, 15, 12, 0).timestamp()  # a Sunday
+    mon = datetime(2026, 11, 9, 9, 0).timestamp()
+    hour = now - 3600
     base = dict(
         sched_ok=True, enabled=True, sess=None, due=False, live=True, probed=True
     )
+    open_run = {"since": mon}
     cases = [
-        ({}, ("not yet", False)),
-        ({"done_ago": "2d ago"}, ("done 2d ago", False)),
-        ({"due": True}, ("starting", False)),
-        ({"due": True, "live": False, "probed": False}, ("not run yet", False)),
-        ({"due": True, "live": False}, ("not run yet", False)),
-        ({"due": True, "live": False, "done_ago": "8d ago"}, ("not run yet", False)),
-        ({"failed": True}, ("failed", False)),
-        ({"sess": agent("idle")}, ("unopened", True)),  # started, never joined
-        ({"sess": agent("idle"), "opened": True}, ("idle", False)),
-        ({"sess": agent("waiting"), "opened": True}, ("waiting", True)),
-        ({"sess": agent("waiting")}, ("waiting", True)),
-        ({"sess": agent("running")}, ("running", False)),
-        ({"sess": _live("routine-lit")}, ("no claude", True)),
-        ({"sess": agent("idle"), "opened": True, "due": True}, ("overdue", True)),
-        ({"enabled": False}, ("paused", False)),
-        ({"sched_ok": False}, ("bad schedule", False)),
-        # unattended: an open session is just running, never waiting on you
-        ({"sess": agent("idle"), "unattended": True}, ("running", False)),
-        ({"sess": _live("routine-lit"), "unattended": True}, ("running", False)),
-        ({"done_ago": "1h ago", "exit_code": 0}, ("done 1h ago", False)),
-        ({"done_ago": "1h ago", "exit_code": 3}, ("failed 1h ago", False)),
+        ({}, ("scheduled", None)),
+        ({"done_at": mon}, ("done Mon ✓", None)),
+        ({"due": True}, ("starting…", None)),
+        ({"due": True, "live": False, "probed": False}, ("due · checking…", None)),
+        ({"due": True, "live": False}, ("missed · computer off", None)),
+        ({"failed": True}, ("couldn't start", None)),
+        # an open run: what to do about it, and since when
+        ({**open_run, "sess": agent("idle")}, ("read it · since Mon", "to read")),
+        (
+            {**open_run, "sess": agent("idle"), "opened": True},
+            ("close it · since Mon", None),
+        ),
+        (
+            {**open_run, "sess": agent("waiting")},
+            ("answer it · since Mon", "to answer"),
+        ),
+        ({**open_run, "sess": agent("running")}, ("working    · since Mon", None)),
+        (
+            {**open_run, "sess": _live("routine-lit")},
+            ("check it · no claude", "to check"),
+        ),
+        (
+            {**open_run, "sess": agent("idle"), "opened": True, "due": True},
+            ("finish it · since Mon", "to finish"),
+        ),
+        ({"enabled": False}, ("paused", None)),
+        ({"sched_ok": False}, ("fix schedule", None)),
+        # unattended: an open session is just working, never waiting on you
+        (
+            {"since": hour, "sess": agent("idle"), "unattended": True},
+            ("working    · since 11:00", None),
+        ),
+        ({"done_at": hour, "exit_code": 0}, ("done 11:00 ✓", None)),
+        ({"done_at": hour, "exit_code": 3}, ("failed 11:00", None)),
     ]
-    for kw, (word, pending) in cases:
-        got = routine_cells._routine_status(**{**base, **kw})
-        assert (got[0], got[2]) == (word, pending), (kw, got)
+    for kw, (word, todo) in cases:
+        got = routine_cells._routine_status(**{**base, **kw}, now=now)
+        assert (got[0], got[2]) == (word, todo), (kw, got)
+    # only a question blinks; amber is for what waits on you, red for what broke
+    styles = {
+        w: routine_cells._routine_status(**{**base, **kw}, now=now)[1]
+        for kw, (w, _) in cases
+    }
+    assert [w for w, st in styles.items() if "blink" in st] == ["answer it · since Mon"]
+    assert "#" not in styles["done Mon ✓"] and "#" not in styles["scheduled"]
+
+
+def test_this_run_dates_are_short():
+    now = datetime(2026, 11, 15, 12, 0).timestamp()
+    day = routine_cells._day
+    assert day(datetime(2026, 11, 15, 9, 5).timestamp(), now) == "09:05"
+    assert day(datetime(2026, 11, 9, 9, 0).timestamp(), now) == "Mon"
+    assert day(datetime(2026, 11, 8, 9, 0).timestamp(), now) == "8 Nov"
 
 
 def test_routine_row_blinks_only_when_an_open_run_wants_you():
@@ -2439,9 +2471,10 @@ def test_routine_row_blinks_only_when_an_open_run_wants_you():
     cells = a._routine_row(a._routines[0], app.time.time())
     assert _cell_text(cells[0]).strip() == "lit"
     assert _cell_text(cells[1]) == "daily 09:00"
-    assert _cell_text(cells[2]) == "waiting" and "blink" in _cell_styles(cells[2])
+    assert _cell_text(cells[2]).startswith("answer it · since")
+    assert "blink" in _cell_styles(cells[2])
     assert _cell_text(cells[4]) == "interactive"
-    assert a._pending_routines(app.time.time()) == {"waiting": 1}
+    assert a._pending_routines(app.time.time()) == {"to answer": 1}
     a._routines[0]["mode"] = "unattended"
     assert _cell_text(a._routine_row(a._routines[0], app.time.time())[4]) == (
         "unattended"
@@ -2449,9 +2482,8 @@ def test_routine_row_blinks_only_when_an_open_run_wants_you():
     a = _routine_app(reachable=False)  # due, but its computer is off: nothing to do
     a._hosts = [h[:8] + ("#ff9e64",) + h[9:] for h in a._hosts]
     cells = a._routine_row(a._routines[0], app.time.time())
-    assert _cell_text(cells[2]) == "not run yet" and "blink" not in _cell_styles(
-        cells[2]
-    )
+    assert _cell_text(cells[2]) == "missed · computer off"
+    assert "blink" not in _cell_styles(cells[2])
     assert a._pending_routines(app.time.time()) == {}
     header = a._host_header_row("box")
     assert _cell_text(header[0]) == "○ box" and "#ff9e64" in _cell_styles(header[0])
@@ -2500,7 +2532,8 @@ def test_badge_counts_pending_outside_the_routines_view():
     a.query_one = lambda sel, *_: wrap
     a._status_note = "autostart: on"
     a._refresh_badge()
-    assert "routines: 1 waiting (v)" in wrap.border_subtitle
+    assert "routines: 1 to answer (v)" in wrap.border_subtitle
+    assert "blink" in wrap.border_subtitle  # Claude is stuck on a question
     assert wrap.border_subtitle.endswith("autostart: on")
     a._panel = "routines"
     a._refresh_badge()
@@ -2536,7 +2569,7 @@ def test_failed_start_backs_off_and_warns_once():
     a._request_render = lambda: None
     r = a._routines[0]
     a._launched(r, "u", "__FAIL__ couldn't write the prompt file (disk full?)\n", False)
-    assert _status(a) == "failed"
+    assert _status(a) == "couldn't start"
     assert _ticked(a) == []  # no retry on the next probe
     a._launched(r, "u", "__FAIL__ couldn't write the prompt file (disk full?)\n", False)
     assert len(toasts) == 1 and "disk full" in toasts[0]
@@ -2657,12 +2690,12 @@ def test_routine_on_a_computer_tailscale_reports_offline_is_offline_not_checking
         _ME,
         ("box", False, "offline", "2h ago", "compute", "o", "", False, "", "u", True),
     ]
-    assert _status(a) == "not run yet"
+    assert _status(a) == "missed · computer off"
     assert a._host_state("box") == "offline"
     a._hosts = [_ME]  # not in the tailnet at all
-    assert _status(a) == "not run yet"
+    assert _status(a) == "missed · computer off"
     a._hosts = []  # before discovery: still checking
-    assert _status(a) == "not run yet"
+    assert _status(a) == "due · checking…"
     assert a._host_state("box") == "checking…"
 
 

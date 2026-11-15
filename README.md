@@ -50,7 +50,7 @@ Claude prompts you run on a schedule, each on one fixed computer. When one is du
 | `space` | pause or resume |
 | `d` | mark the current run done (closes its session; closing it yourself counts too) |
 
-An open run that waits on you blinks — `waiting` (Claude asked you something) or `unopened` (you haven't looked yet) — and the sessions box's border counts them from any view. When the work looks finished, Claude asks “Done with <name>?”; yes notes a one-line outcome and closes the run (`ask_done = false` skips it). Routines are grouped by computer. THIS RUN says whether the current period's run happened (`done 2d ago`, `running`, `waiting`, `unopened`, `not run yet`, …); the card under the table shows what it produced and the runs before it. MODE says whether a routine is `interactive` or `unattended`.
+Routines are grouped by computer. THIS RUN says what to do about the current period's run, and since when: `scheduled` (not started yet; NEXT says when), `working · since 09:00`, `answer it · since Mon` (Claude asked you something), `read it · since Mon` (it finished and you haven't looked), `close it`, `done Mon ✓`, `failed Mon`. Amber means it waits on you, red that something broke; only `answer it` blinks, and the sessions box's border counts what waits on you from any view. When the work looks finished, Claude asks “Done with <name>?”; yes notes a one-line outcome and closes the run (`ask_done = false` skips it). The card under the table shows what a run produced and the runs before it. MODE says whether a routine is `interactive` or `unattended`.
 
 They live in `~/.config/tuimux/routines.toml`:
 
@@ -70,7 +70,7 @@ prompt = """
 """
 ```
 
-**Unattended routines** run `claude -p` instead: Claude asks nothing, the session closes itself when it finishes, and THIS RUN shows `done` or `failed`. Tools outside `allow` (and your `~/.claude/settings.json` allow rules) are denied, and Claude skips those steps. The output is kept in `~/.cache/tuimux/routines/<name>.log`. Use them for skills that need no answers from you.
+**Unattended routines** run `claude -p` instead: Claude asks nothing, the session closes itself when it finishes, and THIS RUN shows `working`, then `done` or `failed`. Tools outside `allow` (and your `~/.claude/settings.json` allow rules) are denied, and Claude skips those steps. The output is kept in `~/.cache/tuimux/routines/<name>.log`. Use them for skills that need no answers from you.
 
 ## Setup conventions
 
