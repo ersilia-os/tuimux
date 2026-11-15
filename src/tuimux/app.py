@@ -135,6 +135,7 @@ ROUTINE_COLUMNS = (
     ("schedule", "SCHEDULE", ("status", "state")),
     ("status", "THIS RUN", ("uptime", "folder")),
     ("next", "NEXT", ("tabs", "open")),
+    ("mode", "MODE", ("owner", "user")),
 )
 
 
@@ -2603,6 +2604,7 @@ class Tuimux(App):
             ((routines.short(r["schedule"]), "dim"),),
             ((word, flash),),
             (nxt,),
+            (("unattended", "") if _unattended(r) else ("interactive", "dim"),),
         )
 
     def _host_state(self, host):
@@ -2624,6 +2626,7 @@ class Tuimux(App):
         return (
             (dot, (host, f"bold {accent}".strip())),
             ((state, AMBER if state == "offline" else "dim"),),
+            (),
             (),
             (),
         )

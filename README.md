@@ -50,7 +50,7 @@ Claude prompts you run on a schedule, each on one fixed computer. When one is du
 | `space` | pause or resume |
 | `d` | mark the current run done (closes its session; closing it yourself counts too) |
 
-An open run that waits on you blinks — `waiting` (Claude asked you something) or `unopened` (you haven't looked yet) — and the sessions box's border counts them from any view. When the work looks finished, Claude asks “Done with <name>?”; yes notes a one-line outcome and closes the run (`ask_done = false` skips it). Routines are grouped by computer. THIS RUN says whether the current period's run happened (`done 2d ago`, `running`, `waiting`, `unopened`, `not run yet`, …); the card under the table shows what it produced and the runs before it.
+An open run that waits on you blinks — `waiting` (Claude asked you something) or `unopened` (you haven't looked yet) — and the sessions box's border counts them from any view. When the work looks finished, Claude asks “Done with <name>?”; yes notes a one-line outcome and closes the run (`ask_done = false` skips it). Routines are grouped by computer. THIS RUN says whether the current period's run happened (`done 2d ago`, `running`, `waiting`, `unopened`, `not run yet`, …); the card under the table shows what it produced and the runs before it. MODE says whether a routine is `interactive` or `unattended`.
 
 They live in `~/.config/tuimux/routines.toml`:
 

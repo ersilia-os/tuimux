@@ -2364,7 +2364,12 @@ def test_routine_row_blinks_only_when_an_open_run_wants_you():
     assert _cell_text(cells[0]).strip() == "lit"
     assert _cell_text(cells[1]) == "daily 09:00"
     assert _cell_text(cells[2]) == "waiting" and "blink" in _cell_styles(cells[2])
+    assert _cell_text(cells[4]) == "interactive"
     assert a._pending_routines(app.time.time()) == {"waiting": 1}
+    a._routines[0]["mode"] = "unattended"
+    assert _cell_text(a._routine_row(a._routines[0], app.time.time())[4]) == (
+        "unattended"
+    )
     a = _routine_app(reachable=False)  # due, but its computer is off: nothing to do
     a._hosts = [h[:8] + ("#ff9e64",) + h[9:] for h in a._hosts]
     cells = a._routine_row(a._routines[0], app.time.time())
