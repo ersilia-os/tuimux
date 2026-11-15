@@ -25,6 +25,7 @@ from tuimux import (  # noqa: E402
     preview,
     routine_cells,
     routines,
+    session_actions,
     theme,
 )
 from tuimux import hosts as hostmod  # noqa: E402
@@ -2456,6 +2457,56 @@ def test_routine_status_lifecycle():
     }
     assert [w for w, st in styles.items() if "blink" in st] == ["answer it · since Mon"]
     assert "#" not in styles["done Mon ✓"] and "#" not in styles["scheduled"]
+
+
+def test_a_pause_shows_next_to_the_run_state():
+    agent = lambda st: {**_live("routine-lit"), "agent": True, "state": st}  # noqa: E731
+    now = datetime(2026, 11, 15, 12, 0).timestamp()
+    mon = datetime(2026, 11, 9, 9, 0).timestamp()
+    base = dict(
+        sched_ok=True, enabled=False, sess=None, due=False, live=True, probed=True
+    )
+    status = lambda **kw: routine_cells._routine_status(**{**base, **kw}, now=now)  # noqa: E731
+    assert status(since=mon, sess=agent("waiting"))[0] == "answer it · paused"
+    assert status(done_at=mon)[0] == "done Mon ✓ · paused"
+    assert status(done_at=mon, exit_code=2)[0] == "failed Mon · paused"
+    assert status()[0] == "paused"
+
+
+def test_routine_menu_offers_what_fits_the_run():
+    r = {"enabled": True}
+    idle = [i for _, i in routine_cells._routine_options(r, open_run=False)]
+    assert idle == ["run", "edit", "copy", "toggle", "delete"]
+    running = routine_cells._routine_options(r, open_run=True)
+    assert running[0] == ("↵  open its session", "run") and running[1][1] == "done"
+    labels = dict(
+        (i, t) for t, i in routine_cells._routine_options({"enabled": False}, False)
+    )
+    assert labels["toggle"] == "▶  resume"
+
+
+def test_space_on_a_routine_opens_its_menu_and_pauses_nothing():
+    a = _routine_app(sessions=[])
+    a._cur_routine = lambda: a._routines[0]
+    shown = []
+    a.push_screen = lambda screen, cb: shown.append((screen, cb))
+    a.action_routine_menu()
+    ((menu, chosen),) = shown
+    assert menu.title_text == "lit" and a._routines[0]["enabled"]  # not paused
+    saved = []
+    a._save_routines = lambda: saved.append(True)
+    a.notify = lambda *x, **k: None
+    chosen("toggle")  # pausing is now a deliberate menu choice
+    assert not a._routines[0]["enabled"] and saved
+
+
+def test_session_menu_options_are_unchanged():
+    opts = session_actions._session_options
+    assert [i for _, i in opts({"action": "new"})] == ["open", "window", "rename"]
+    closed = [i for _, i in opts({"action": "attach", "open": False})]
+    assert closed == ["open", "window", "rename", "close"]
+    shown = [i for _, i in opts({"action": "attach", "open": True})]
+    assert shown == ["open", "window", "rename", "detach", "close"]
 
 
 def test_this_run_dates_are_short():
