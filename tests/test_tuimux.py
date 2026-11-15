@@ -2459,6 +2459,8 @@ def test_routine_row_blinks_only_when_an_open_run_wants_you():
     calm = _routine_app(sessions=[], since=app.time.time())  # just scheduled
     assert "blink" not in _cell_styles(calm._routine_row(calm._routines[0], 0)[2])
     assert _cell_text(calm._host_header_row("box")[1]) == "online"
+    me = _cell_text(calm._host_header_row("me")[0]), calm._host_header_row("me")[1]
+    assert me[0] == "● me" and _cell_text(me[1]) == "local"  # this machine
 
 
 def test_probe_marks_a_run_joined_then_done():

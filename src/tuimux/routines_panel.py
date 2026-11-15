@@ -160,7 +160,12 @@ class RoutinesPanel:
         )
 
     def _host_state(self, host):
-        """ "online", "offline" or "checking…" for a computer, from its probes."""
+        """ "local", "online", "offline" or "checking…" for a computer.
+
+        "local" is this machine, as the sessions table calls it; the rest come
+        from its probes."""
+        if any(h[0] == host and h[1] for h in self._hosts):
+            return "local"
         infos = [v for (h, _), v in self._results.items() if h == host]
         if any(i.get("reachable") and not i.get("stale") for i in infos):
             return "online"
@@ -174,7 +179,9 @@ class RoutinesPanel:
         """The cells of a computer's header row in the routines table."""
         state = self._host_state(host)
         accent = self._host_accent(host)
-        dot = _marker({"online": "up", "offline": "offline"}.get(state, "checking"))
+        dot = _marker(
+            {"local": "up", "online": "up", "offline": "offline"}.get(state, "checking")
+        )
         return (
             (dot, (host, f"bold {accent}".strip())),
             ((state, AMBER if state == "offline" else "dim"),),
