@@ -17,35 +17,81 @@ from .fmt import (
     _uptime,
 )
 
+
+def _read_config(path):
+    """The ``TUIMUX_*`` assignments in the config file the engine sources.
+
+    Parameters
+    ----------
+    path : str
+        The config file (shell syntax: ``TUIMUX_X=value``, quotes and comments
+        allowed).
+
+    Returns
+    -------
+    dict
+        ``{name: value}``; empty if the file is missing or unreadable.
+    """
+    out = {}
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError:
+        return out
+    for ln in lines:
+        m = re.match(r"\s*(?:export\s+)?(TUIMUX_[A-Z0-9_]+)=(.*)$", ln)
+        if not m:
+            continue
+        raw = m.group(2).strip()
+        if raw[:1] in ("'", '"'):
+            end = raw.find(raw[0], 1)
+            out[m.group(1)] = raw[1:end] if end > 0 else raw[1:]
+        else:
+            out[m.group(1)] = raw.split()[0] if raw else ""
+    return out
+
+
+# The dashboard's settings come from the environment, else from the same config
+# file the engine reads (so config.example's settings work wherever you put them).
+_CONFIG = _read_config(
+    os.path.expanduser(os.environ.get("TUIMUX_CONFIG") or "~/.config/tuimux/config")
+)
+
+
+def _setting(name, default):
+    """A dashboard setting: the environment wins, then the config file."""
+    return os.environ.get(name) or _CONFIG.get(name) or default
+
+
 ENGINE = str(files("tuimux").joinpath("engine.sh"))
 # TUIMUX_BIN tells the engine its own absolute path, so sessions it spawns into
 # new terminal tabs re-invoke tuimux even when it isn't on the tab's PATH
 # (e.g. installed in a conda env / venv that isn't activated by default).
 _ENV = {**os.environ, "TUIMUX_BIN": tuimux_bin()}
-REFRESH = float(os.environ.get("TUIMUX_REFRESH", "3") or 3)
+REFRESH = float(_setting("TUIMUX_REFRESH", "3"))
 # Hold off the periodic refresh until you've stopped pressing keys for this long,
 # so navigating the list stays fluid (no probe/render churn mid-keystroke). The
 # refresh still runs on every tick once you're idle, and immediately on returning
 # from a dialog.
-QUIET = float(os.environ.get("TUIMUX_QUIET", "1.2") or 1.2)
+QUIET = float(_setting("TUIMUX_QUIET", "1.2"))
 # How long a "resumed"/"lost" verdict stays on screen after a machine reconnects.
-RECONCILE_TTL = float(os.environ.get("TUIMUX_RECONCILE_TTL", "30") or 30)
+RECONCILE_TTL = float(_setting("TUIMUX_RECONCILE_TTL", "30"))
 AWAKE = "keep-awake"
 
 # A probe that can't finish in this many seconds is treated as unreachable, so
 # one slow/contended host can't stall (or back up) the whole refresh.
-PROBE_TIMEOUT = float(os.environ.get("TUIMUX_PROBE_TIMEOUT", "10") or 10)
+PROBE_TIMEOUT = float(_setting("TUIMUX_PROBE_TIMEOUT", "10"))
 # Mutating actions (detach/close/rename/awake) run off the UI thread; cap them
 # too so a slow host can't leave a worker hanging forever.
-ACTION_TIMEOUT = float(os.environ.get("TUIMUX_ACTION_TIMEOUT", "15") or 15)
+ACTION_TIMEOUT = float(_setting("TUIMUX_ACTION_TIMEOUT", "15"))
 # Host discovery (tailscale status) — bounded so a wedged tailscaled can't hang
 # the host-scan worker indefinitely.
-HOSTS_TIMEOUT = float(os.environ.get("TUIMUX_HOSTS_TIMEOUT", "8") or 8)
+HOSTS_TIMEOUT = float(_setting("TUIMUX_HOSTS_TIMEOUT", "8"))
 # Terminal window/tab scan (AppleScript) used to show where a session is open.
-WINDOWS_TIMEOUT = float(os.environ.get("TUIMUX_WINDOWS_TIMEOUT", "5") or 5)
+WINDOWS_TIMEOUT = float(_setting("TUIMUX_WINDOWS_TIMEOUT", "5"))
 # Live-preview pane capture (tmux capture-pane, local or over SSH). Short, since
 # it's a tiny read that fires on navigation and every heartbeat.
-PEEK_TIMEOUT = float(os.environ.get("TUIMUX_PEEK_TIMEOUT", "6") or 6)
+PEEK_TIMEOUT = float(_setting("TUIMUX_PEEK_TIMEOUT", "6"))
 # How many of the pane's most-recent lines the preview shows when its on-screen
 # height isn't known yet (before first layout). The tail is what matters — the
 # prompt and the latest output sit at the bottom of a tmux pane.
@@ -54,15 +100,15 @@ PREVIEW_LINES = 12
 # probes the whole online fleet to discover which boxes you can log into; this keeps
 # steady-state light — reachable/own boxes refresh every tick, boxes you have no
 # account on are retried only this often (enough to notice newly-granted access).
-RECHECK = float(os.environ.get("TUIMUX_RECHECK", "60") or 60)
+RECHECK = float(_setting("TUIMUX_RECHECK", "60"))
 # Keep one SSH shell open per remote host (remote.py) instead of paying the ~2s
 # Tailscale SSH handshake on every probe/preview/action. "off" = old per-call ssh.
-PERSIST = os.environ.get("TUIMUX_PERSIST", "on").lower() not in ("off", "0", "no")
+PERSIST = _setting("TUIMUX_PERSIST", "on").lower() not in ("off", "0", "no")
 # How often (seconds) to re-read the terminal's window/tab titles for OPEN IN. On
 # Ghostty that's an accessibility walk that stalls Ghostty's own redraw (i.e. this
 # dashboard), so it's kept off the refresh tick; it also runs on returning to the
 # dashboard and shortly after you open/detach/close something.
-WINDOWS_EVERY = float(os.environ.get("TUIMUX_WINDOWS_EVERY", "15") or 15)
+WINDOWS_EVERY = float(_setting("TUIMUX_WINDOWS_EVERY", "15"))
 # Wait this long after the cursor stops before capturing a preview, so holding an
 # arrow key sends one capture instead of one per row passed.
 PEEK_DEBOUNCE = 0.12

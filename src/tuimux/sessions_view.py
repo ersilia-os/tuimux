@@ -19,6 +19,7 @@ from .theme import (
     AMBER,
     GREEN,
     MUTED,
+    SESSION_COLUMNS,
     _marker,
     _row,
 )
@@ -390,18 +391,10 @@ class SessionsView:
         """An inert, end-to-end divider between your devices and everyone else's
         (only ever shown under "o"). A thin rule across every column; not a real
         row you can act on (every action gates on action in (attach|new))."""
-        # dashes sized to each column (must match the add_column widths above) so
-        # the line reads as continuous across the whole table
+        # dashes sized to each column so the line reads as continuous across the
+        # whole table (the row's "open_in" cell is the OPEN IN column, "open")
         widths = {
-            "name": 26,
-            "status": 9,
-            "state": 10,
-            "uptime": 6,
-            "folder": 20,
-            "tabs": 13,
-            "open_in": 20,
-            "owner": 10,
-            "user": 14,
+            ("open_in" if key == "open" else key): w for key, _, w in SESSION_COLUMNS
         }
         meta = {"host": None, "login": "", "session": None, "action": "separator"}
         cells = {col: (("─" * w, "dim"),) for col, w in widths.items()}

@@ -67,6 +67,9 @@
 # dropped when opening a session on a slow machine.
 # TUIMUX_SPAWN_DELAY=0.2
 
+# The dashboard settings below are read from this file too; an environment
+# variable of the same name wins.
+
 # Dashboard auto-refresh interval (seconds).
 # TUIMUX_REFRESH=3
 
@@ -80,6 +83,10 @@
 
 # How long host discovery (tailscale status) may run before giving up this tick.
 # TUIMUX_HOSTS_TIMEOUT=8
+
+# How often (seconds) to re-probe a box that refused SSH (one you have no
+# account on). Reachable boxes refresh every tick; this keeps the rest light.
+# TUIMUX_RECHECK=60
 
 # How long the terminal window/tab scan (used for the "OPEN IN" column) may run.
 # TUIMUX_WINDOWS_TIMEOUT=5
