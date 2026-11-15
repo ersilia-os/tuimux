@@ -219,7 +219,15 @@ def _ordinal(n):
 def describe(text):
     """A schedule phrase as people say it: "weekly mon 08:00" → "Mondays · 08:00".
 
-    Returns the phrase unchanged if it doesn't parse.
+    Parameters
+    ----------
+    text : str
+        A schedule phrase.
+
+    Returns
+    -------
+    str
+        The readable form, or `text` unchanged if it doesn't parse.
     """
     try:
         s = parse(text)
@@ -257,8 +265,18 @@ def describe(text):
 
 
 def short(text):
-    """A schedule phrase in a few characters: "Mon 09:00", "daily 08:00",
-    "every 6h". Returns the phrase unchanged if it doesn't parse."""
+    """A schedule phrase in a few characters: "Mon 09:00", "daily 08:00", "every 6h".
+
+    Parameters
+    ----------
+    text : str
+        A schedule phrase.
+
+    Returns
+    -------
+    str
+        The short form, or `text` unchanged if it doesn't parse.
+    """
     try:
         s = parse(text)
     except ValueError:
@@ -276,12 +294,34 @@ def short(text):
 
 
 def session_name(name):
-    """The tmux session a routine runs in."""
+    """The tmux session a routine runs in.
+
+    Parameters
+    ----------
+    name : str
+        The routine's name.
+
+    Returns
+    -------
+    str
+        ``routine-<name>``.
+    """
     return SESSION_PREFIX + name
 
 
 def check_name(name):
-    """Raise ValueError unless `name` is a valid routine name (a lowercase slug)."""
+    """Raise ValueError unless `name` is a valid routine name (a lowercase slug).
+
+    Parameters
+    ----------
+    name : str
+        The name to check.
+
+    Raises
+    ------
+    ValueError
+        If `name` isn't a lowercase slug.
+    """
     if not _SLUG.match(name or ""):
         raise ValueError("name: lowercase letters, digits and dashes, e.g. lit-digest")
 
@@ -375,7 +415,15 @@ def dump_registry(routines):
 
 
 def save_registry(routines, path=None):
-    """Write the registry atomically."""
+    """Write the registry atomically.
+
+    Parameters
+    ----------
+    routines : list of dict
+        The routines, as `load_registry` returns them.
+    path : str, optional
+        The registry file (default ``REGISTRY``).
+    """
     _write(path or REGISTRY, dump_registry(routines))
 
 
@@ -383,8 +431,18 @@ def save_registry(routines, path=None):
 def load_state(path=None):
     """Read ``{name: {"since", "last", "opened", "done", "runs"}}``.
 
-    Returns an empty dict if the file is missing or unreadable. Entries from
-    older versions load with ``opened=False``, ``done=None`` and ``runs=[]``.
+    Entries from older versions load with ``opened=False``, ``done=None`` and
+    ``runs=[]``.
+
+    Parameters
+    ----------
+    path : str, optional
+        The state file (default ``STATE``).
+
+    Returns
+    -------
+    dict
+        The run state per routine; empty if the file is missing or unreadable.
     """
     try:
         with open(path or STATE) as f:
@@ -417,29 +475,80 @@ def _run(x):
 
 
 def add_run(entry, start, failed=False):
-    """Record a new run (or a failed start) in `entry`, keeping the last HISTORY."""
+    """Record a new run (or a failed start) in `entry`, keeping the last HISTORY.
+
+    Parameters
+    ----------
+    entry : dict
+        The routine's run state, changed in place.
+    start : float
+        Epoch seconds the run started.
+    failed : bool
+        Whether it failed to start.
+    """
     runs = entry.setdefault("runs", [])
     runs.append(_run({"start": start, "failed": failed}))
     del runs[:-HISTORY]
 
 
 def current_run(entry):
-    """The latest run that actually started (not a failed start), or None."""
+    """The latest run that actually started (not a failed start).
+
+    Parameters
+    ----------
+    entry : dict
+        The routine's run state.
+
+    Returns
+    -------
+    dict or None
+        The run, or None if none has started.
+    """
     return next((r for r in reversed(entry.get("runs", [])) if not r["failed"]), None)
 
 
 def base_time(entry):
-    """The time a routine's schedule counts from: its last run, else its creation."""
+    """The time a routine's schedule counts from: its last run, else its creation.
+
+    Parameters
+    ----------
+    entry : dict
+        The routine's run state.
+
+    Returns
+    -------
+    float
+        Epoch seconds.
+    """
     return entry["last"] if entry.get("last") is not None else entry["since"]
 
 
 def new_entry(now):
-    """State for a routine added at `now`: never run, so nothing to open or finish."""
+    """State for a routine added at `now`: never run, so nothing to open or finish.
+
+    Parameters
+    ----------
+    now : float
+        Epoch seconds.
+
+    Returns
+    -------
+    dict
+        A fresh run-state entry.
+    """
     return {"since": now, "last": None, "opened": False, "done": None, "runs": []}
 
 
 def save_state(state, path=None):
-    """Write the run state atomically."""
+    """Write the run state atomically.
+
+    Parameters
+    ----------
+    state : dict
+        The run state per routine.
+    path : str, optional
+        The state file (default ``STATE``).
+    """
     _write(path or STATE, json.dumps(state, indent=1, sort_keys=True))
 
 
