@@ -1,7 +1,7 @@
 """Routines: Claude prompts you run on a schedule, each on one fixed computer.
 
 The registry is a hand-editable TOML file of ``[[routine]]`` tables (name,
-host, login, folder, schedule, enabled, prompt). Run history lives apart from
+host, login, folder, schedule, enabled, ask_done, mode, allow, prompt). Run history lives apart from
 it, in a small JSON state file, so the registry stays purely yours. Per
 routine: ``since`` (when it was added), ``last`` (when its current run
 started), ``opened`` (whether you've joined that run), ``done`` (when it was
@@ -29,8 +29,11 @@ FIELDS = (
     "schedule",
     "enabled",
     "ask_done",
+    "mode",
+    "allow",
     "prompt",
 )
+MODES = ("interactive", "unattended")
 
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -321,6 +324,10 @@ def load_registry(path=None):
                 "enabled": bool(r.get("enabled", True)),
                 # Claude asks "done?" when finished; yes closes the run
                 "ask_done": bool(r.get("ask_done", True)),
+                # unattended: claude runs in print mode, asks nothing, and the
+                # run closes itself; `allow` lists the tools it may use
+                "mode": "unattended" if r.get("mode") == "unattended" else MODES[0],
+                "allow": str(r.get("allow", "")).strip(),
                 "prompt": str(r.get("prompt", "")).strip("\n"),
             }
         )
@@ -358,6 +365,8 @@ def dump_registry(routines):
             lines.append(f"{k} = {_toml_str(r.get(k, ''))}")
         for k in ("enabled", "ask_done"):
             lines.append(f"{k} = {'true' if r.get(k, True) else 'false'}")
+        lines.append(f"mode = {_toml_str(r.get('mode') or MODES[0])}")
+        lines.append(f"allow = {_toml_str(r.get('allow', ''))}")
         lines.append(f"prompt = {_toml_multiline(r.get('prompt', ''))}")
         blocks.append("\n".join(lines))
     head = "# tuimux routines — edit here or from the dashboard (n / e).\n\n"
@@ -400,6 +409,8 @@ def _run(x):
         "start": float(x.get("start") or 0),
         "done": None if done is None else float(done),
         "failed": bool(x.get("failed", False)),
+        # an unattended run's exit code (None: interactive, or not known yet)
+        "exit": None if x.get("exit") is None else int(x["exit"]),
         "outcome": x.get("outcome") or None,
     }
 

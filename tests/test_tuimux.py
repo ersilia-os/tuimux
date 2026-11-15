@@ -2231,15 +2231,19 @@ def test_registry_round_trip_keeps_awkward_prompts():
             "schedule": "daily 09:00",
             "enabled": False,
             "ask_done": False,
+            "mode": "unattended",
+            "allow": 'Read,Bash(gh "x" *)',
             "prompt": prompt,
         }
     ]
     routines.save_registry(rs)
     assert routines.load_registry() == rs
-    # a routine written before ask_done existed asks by default
+    # a routine written before ask_done/mode existed asks, and is interactive
     with open(routines.REGISTRY, "w") as f:
-        f.write('[[routine]]\nname = "old"\nprompt = "/x"\n')
-    assert routines.load_registry()[0]["ask_done"] is True
+        f.write('[[routine]]\nname = "old"\nprompt = "/x"\nmode = "bogus"\n')
+    old = routines.load_registry()[0]
+    assert old["ask_done"] is True
+    assert (old["mode"], old["allow"]) == ("interactive", "")
     # a state file from before opened/done existed still loads
     routines.save_state({"lit": {"since": 1.0, "last": None}})
     entry = {"since": 1.0, "last": None, "opened": False, "done": None, "runs": []}
@@ -2342,6 +2346,11 @@ def test_routine_status_lifecycle():
         ({"sess": agent("idle"), "opened": True, "due": True}, ("overdue", True)),
         ({"enabled": False}, ("paused", False)),
         ({"sched_ok": False}, ("bad schedule", False)),
+        # unattended: an open session is just running, never waiting on you
+        ({"sess": agent("idle"), "unattended": True}, ("running", False)),
+        ({"sess": _live("routine-lit"), "unattended": True}, ("running", False)),
+        ({"done_ago": "1h ago", "exit_code": 0}, ("done 1h ago", False)),
+        ({"done_ago": "1h ago", "exit_code": 3}, ("failed 1h ago", False)),
     ]
     for kw, (word, pending) in cases:
         got = app._routine_status(**{**base, **kw})
@@ -2602,6 +2611,29 @@ def test_ask_done_hands_claude_the_finish_instruction_separately():
     assert "--append-system-prompt" not in plain and "Done with" not in plain
 
 
+def test_unattended_routine_runs_claude_in_print_mode_and_closes_itself():
+    out = subprocess.run(
+        ["bash", app.ENGINE, "__remote", "launch", "routine-t", "~", "t", "h", "u"]
+        + ["1", "1", "Read,Bash(gh *)"],
+        input="/literature-digest",
+        capture_output=True,
+        text=True,
+    ).stdout
+    typed = next(ln for ln in out.splitlines() if " -l " in ln)
+    assert 't.run.sh"; exit' in typed  # the session closes when the run ends
+    assert "claude -p" in out and "--permission-mode dontAsk" in out
+    assert "--allowedTools 'Read,Bash(gh *)'" in out
+    assert "Never ask the user anything" in out
+    assert "Done with" not in out  # unattended never asks "done?"
+    assert 'echo $? > "$d/t.exit"' in out
+
+
+def test_outcome_read_carries_an_unattended_runs_exit_code():
+    assert app._parse_outcome("__EXIT__ 3\n12 new papers\n") == ("12 new papers", 3)
+    assert app._parse_outcome("\n  done fine \n") == ("done fine", None)
+    assert app._parse_outcome("") == ("", None)
+
+
 def test_describe_reads_like_people_talk():
     cases = {
         "weekly mon 08:00": "Mondays · 08:00",
@@ -2701,3 +2733,19 @@ def test_routines_columns_line_up_with_the_sessions_columns():
     sessions = starts(w for _, _, w in app.SESSION_COLUMNS)
     routines = starts(app._span_width(keys) for _, _, keys in app.ROUTINE_COLUMNS)
     assert set(routines) <= set(sessions)
+
+
+def test_failed_unattended_run_is_kept_and_shown():
+    a = _routine_app(sessions=[])
+    a._save_state = lambda: None
+    a._request_render = lambda: None
+    a._routines[0]["mode"] = "unattended"
+    entry = a._rstate["lit"] = routines.new_entry(0)
+    routines.add_run(entry, 100.0)
+    entry["runs"][-1]["done"] = 200.0
+    a._got_outcome("lit", 100.0, "couldn't reach the API", 1)
+    assert entry["runs"][-1]["exit"] == 1
+    card = app._routine_detail(a._routines[0], entry, now=300).plain.split("\n")
+    assert "unattended" in card[0]
+    assert card[1].startswith("failed (exit 1): couldn't reach the API")
+    assert "routines/lit.log" in card[1]
