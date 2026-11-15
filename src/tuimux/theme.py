@@ -184,19 +184,41 @@ APP_CSS = """
         height: 4; padding: 1 1 0 1; color: $text-muted;  /* rule, gap, 2 lines */
         border-top: solid $foreground 8%;
     }
+    /* The routine form: flat one-line fields on a soft fill (no boxes), quiet
+       labels above them, hints aligned with the field text, focus as a tint. */
     #form {
-        width: 92; height: auto; padding: 1 3; margin: 1;
+        width: 92; height: auto; max-height: 100%; padding: 1 3; margin: 1;
         background: $panel; border: round $foreground 20%;
+        overflow-y: auto;
     }
-    #form-title { color: $foreground; text-style: bold; padding: 0 0 1 0; }
+    #form-title {
+        width: 1fr; color: $foreground; text-style: bold;
+        padding: 0 0 1 0; border-bottom: solid $foreground 10%;
+    }
     #form .row { height: auto; }
     #form .col { width: 1fr; height: auto; }
     #form .col:first-of-type { margin-right: 2; }
-    #form .field { color: $text-muted; margin-top: 1; }
+    #form .field { color: $text-muted; margin-top: 1; height: 1; }
     #form .hint { height: 1; padding: 0 1; }
-    #form TextArea { height: 6; }
-    #f-error { margin-top: 1; height: auto; }
-    #form-keys { color: $text-muted; margin-top: 1; }
+    #form Input, #form TextArea, #form Select > SelectCurrent {
+        border: none; background: $surface; padding: 0 1;
+    }
+    #form Input, #form Select > SelectCurrent { height: 1; }
+    #form Select { height: auto; }
+    #form Input:focus, #form TextArea:focus, #form Select:focus > SelectCurrent {
+        background: $primary 22%;
+    }
+    #form TextArea { height: 4; }
+    #form Checkbox {
+        border: none; background: transparent; padding: 0; margin-top: 1;
+        height: 1;
+    }
+    #form Checkbox:focus > .toggle--label { background: $primary 22%; }
+    #f-error { margin-top: 1; height: auto; display: none; }
+    #form-keys {
+        margin-top: 1; padding: 1 0 0 0; border-top: solid $foreground 10%;
+        width: 1fr;
+    }
     #dialog {
         width: 56; height: auto; padding: 1 2; margin: 1;
         background: $panel; border: round $foreground 20%;

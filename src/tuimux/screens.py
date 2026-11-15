@@ -26,6 +26,7 @@ from . import routines
 from .theme import (
     AMBER,
     RED,
+    STEEL,
 )
 
 
@@ -134,37 +135,30 @@ class Ask(ModalScreen[str]):
 
 
 class Menu(ModalScreen[str]):
-    """The actions for a session row; dismisses with the chosen action id."""
+    """The actions for a row (``space``); dismisses with the chosen action id.
+
+    Parameters
+    ----------
+    title : str
+        What the menu is about: a session or a routine name.
+    options : list of tuple
+        ``(label, action_id)`` pairs, in display order.
+    """
 
     BINDINGS = [("escape", "cancel")]
 
-    def __init__(self, meta):
+    def __init__(self, title, options):
         super().__init__()
-        self.meta = meta
+        self.title_text = title
+        self.options = options
 
     def compose(self) -> ComposeResult:
-        """Lay out the actions that apply to this row."""
-        attach = self.meta["action"] == "attach"
-        title = self.meta["session"] if attach else "new session"
-        if attach:
-            opened = self.meta.get("open")
-            opts = [
-                ("↵  go to its tab" if opened else "↵  open in a new tab", "open"),
-                ("⊕  open in a new window", "window"),
-                ("✎  rename", "rename"),
-            ]
-            if opened:  # only meaningful when it's actually open
-                opts.append(("⏏  detach (close its tab, keep running)", "detach"))
-            opts.append(("✕  close (kill session)", "close"))
-        else:
-            opts = [
-                ("↵  new tab", "open"),
-                ("⊕  new window", "window"),
-                ("✎  name & create", "rename"),
-            ]
+        """Lay out the title and its actions."""
         with Vertical(id="dialog"):
-            yield Label(title, id="dialog-msg")
-            yield OptionList(*[Option(t, id=i) for t, i in opts], id="menu-list")
+            yield Label(self.title_text, id="dialog-msg")
+            yield OptionList(
+                *[Option(t, id=i) for t, i in self.options], id="menu-list"
+            )
 
     def on_mount(self):
         """Focus the actions."""
@@ -193,6 +187,17 @@ class SessionTable(DataTable):
         Binding("enter", "select_cursor", "open tab", key_display="enter"),
         Binding("right", "app.menu", "menu", show=False),  # app.* → App.action_menu
     ]
+
+
+def _keys(*pairs):
+    """A key-hint line styled like the footer: steel keys, muted actions."""
+    out = Text()
+    for i, (key, what) in enumerate(pairs):
+        if i:
+            out.append("   ")
+        out.append(key, f"bold {STEEL}")
+        out.append(f" {what}", "dim")
+    return out
 
 
 class RoutineForm(ModalScreen[dict]):
@@ -248,18 +253,21 @@ class RoutineForm(ModalScreen[dict]):
             yield Input(r["schedule"], placeholder="weekly mon 09:00", id="f-schedule")
             yield Label("", id="f-next", classes="hint")
             yield Label(
-                "prompt — usually a skill, e.g. /literature-digest", classes="field"
+                Text.assemble(
+                    "prompt", ("  ·  usually a skill, e.g. /literature-digest", "dim")
+                ),
+                classes="field",
             )
             yield TextArea(r["prompt"], id="f-prompt")
             yield Label("mode", classes="field")
             yield Select(
                 (
                     (
-                        "interactive — claude waits for you in its session",
+                        "interactive  ·  Claude waits for you in its session",
                         "interactive",
                     ),
                     (
-                        "unattended — claude runs alone and the run closes itself",
+                        "unattended  ·  Claude runs alone; the run closes itself",
                         "unattended",
                     ),
                 ),
@@ -268,12 +276,14 @@ class RoutineForm(ModalScreen[dict]):
                 id="f-mode",
             )
             yield Checkbox(
-                "ask when finished — Claude asks “done?”, and yes closes the run",
+                "ask “done?” when finished  ·  yes closes the run",
                 r.get("ask_done", True),
                 id="f-ask-done",
             )
             yield Label(
-                "allow — tools it may use; everything else is denied",
+                Text.assemble(
+                    "allow", ("  ·  tools it may use; everything else is denied", "dim")
+                ),
                 classes="field",
                 id="f-allow-label",
             )
@@ -284,7 +294,11 @@ class RoutineForm(ModalScreen[dict]):
             )
             yield Label("", id="f-error")
             yield Label(
-                "ctrl+s save  ·  ctrl+o prompt in $EDITOR  ·  esc cancel",
+                _keys(
+                    ("ctrl+s", "save"),
+                    ("ctrl+o", "prompt in $EDITOR"),
+                    ("esc", "cancel"),
+                ),
                 id="form-keys",
             )
 
@@ -365,7 +379,9 @@ class RoutineForm(ModalScreen[dict]):
         return ""
 
     def _error(self, msg):
-        self.query_one("#f-error", Label).update(Text(msg, style=AMBER))
+        err = self.query_one("#f-error", Label)
+        err.update(Text(msg, style=AMBER))
+        err.display = True  # hidden until there's something to say
 
     def action_editor(self):
         """Edit the prompt in $EDITOR."""
@@ -416,7 +432,7 @@ class RoutineTable(DataTable):
         Binding("d", "app.routine_done", "done"),
         # also there, kept out of the footer so it stays calm
         Binding("x", "app.routine_delete", "delete", show=False),
-        Binding("space", "app.routine_toggle", "pause/resume", show=False),
+        Binding("space", "app.routine_menu", "menu"),
         Binding("c", "app.routine_copy", "duplicate", show=False),
         Binding("E", "app.routine_editor", "prompt in $EDITOR", show=False),
     ]

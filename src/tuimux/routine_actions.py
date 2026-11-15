@@ -10,8 +10,10 @@ from .hosts import (
     _unattended,
     host_read,
 )
+from .routine_cells import _routine_options
 from .screens import (
     Confirm,
+    Menu,
     RoutineForm,
     edit_in_editor,
 )
@@ -45,6 +47,27 @@ class RoutineActions:
             ),
             ok,
         )
+
+    def action_routine_menu(self):
+        """Show the actions for the highlighted routine (space)."""
+        r = self._cur_routine()
+        if r is None:
+            return
+        open_run = self._routine_info(r)[2] is not None
+        handlers = {
+            "run": self.action_routine_run,
+            "done": self.action_routine_done,
+            "edit": self.action_routine_edit,
+            "copy": self.action_routine_copy,
+            "toggle": self.action_routine_toggle,
+            "delete": self.action_routine_delete,
+        }
+
+        def chosen(act):
+            if act in handlers:
+                handlers[act]()
+
+        self.push_screen(Menu(r["name"], _routine_options(r, open_run)), chosen)
 
     def action_routine_run(self):
         """Run the highlighted routine now, or open its running session."""
@@ -228,4 +251,4 @@ class RoutineActions:
             return
         r["enabled"] = not r["enabled"]
         self._save_routines()
-        self.notify(f"{r['name']} {'resumed' if r['enabled'] else 'paused'}", timeout=2)
+        self.notify(f"{r['name']} {'resumed' if r['enabled'] else 'paused'}", timeout=4)

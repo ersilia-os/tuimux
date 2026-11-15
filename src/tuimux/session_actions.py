@@ -20,6 +20,37 @@ from .screens import (
 )
 
 
+def _session_options(meta):
+    """The menu for a session row: ``[(label, action_id)]``.
+
+    Parameters
+    ----------
+    meta : dict
+        The row's meta (``action`` is "attach" or "new"; ``open`` whether it's
+        open in a local tab).
+
+    Returns
+    -------
+    list of tuple
+    """
+    if meta["action"] != "attach":
+        return [
+            ("↵  new tab", "open"),
+            ("⊕  new window", "window"),
+            ("✎  name & create", "rename"),
+        ]
+    opened = meta.get("open")
+    opts = [
+        ("↵  go to its tab" if opened else "↵  open in a new tab", "open"),
+        ("⊕  open in a new window", "window"),
+        ("✎  rename", "rename"),
+    ]
+    if opened:  # only meaningful when it's actually open
+        opts.append(("⏏  detach (close its tab, keep running)", "detach"))
+    opts.append(("✕  close (kill session)", "close"))
+    return opts
+
+
 class SessionActions:
     """The sessions table's key actions (mixed into Tuimux)."""
 
@@ -81,7 +112,8 @@ class SessionActions:
             if act in handlers:
                 handlers[act]()
 
-        self.push_screen(Menu(m), chosen)
+        title = m["session"] if m["action"] == "attach" else "new session"
+        self.push_screen(Menu(title, _session_options(m)), chosen)
 
     def action_open(self):
         """Open the highlighted session in a tab (focus it if already open)."""

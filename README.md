@@ -45,9 +45,9 @@ Claude prompts you run on a schedule, each on one fixed computer. When one is du
 
 | Key | |
 |---|---|
-| `enter` | run it now |
+| `enter` | run it now (or open its session if a run is open) |
 | `n` / `e` / `c` / `x` | add / edit / duplicate / delete (`ctrl+o` in the form opens the prompt in `$EDITOR`) |
-| `space` | pause or resume |
+| `space` | menu: run or open, mark done, edit, duplicate, pause or resume, delete |
 | `d` | mark the current run done (closes its session; closing it yourself counts too) |
 
 Routines are grouped by computer. THIS RUN says what to do about the current period's run, and since when: `scheduled` (not started yet; NEXT says when), `working · since 09:00`, `answer it · since Mon` (Claude asked you something), `read it · since Mon` (it finished and you haven't looked), `close it`, `done Mon ✓`, `failed Mon`. Amber means it waits on you, red that something broke; only `answer it` blinks, and the sessions box's border counts what waits on you from any view. When the work looks finished, Claude asks “Done with <name>?”; yes notes a one-line outcome and closes the run (`ask_done = false` skips it). The card under the table shows what a run produced and the runs before it. MODE says whether a routine is `interactive` or `unattended`.

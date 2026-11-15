@@ -147,6 +147,32 @@ def _routine_summary(total, pending):
     return note
 
 
+def _routine_options(r, open_run):
+    """The menu for a routine row: ``[(label, action_id)]``.
+
+    Parameters
+    ----------
+    r : dict
+        The routine.
+    open_run : bool
+        Whether a run of it is open (its session exists).
+
+    Returns
+    -------
+    list of tuple
+    """
+    opts = [("↵  open its session", "run")] if open_run else [("↵  run now", "run")]
+    if open_run:
+        opts.append(("✓  mark done (close the run)", "done"))
+    opts += [
+        ("✎  edit", "edit"),
+        ("⧉  duplicate", "copy"),
+        ("⏸  pause" if r["enabled"] else "▶  resume", "toggle"),
+        ("✕  delete", "delete"),
+    ]
+    return opts
+
+
 def _day(t, now):
     """A short date for the THIS RUN column, relative to `now`.
 
@@ -226,22 +252,28 @@ def _routine_status(
     """
     now = now or time.time()
     when = _day(since, now) if since else "—"
+    # a pause never hides: it takes the place of "since …" on an open run
+    tail = f"since {when}" if enabled else "paused"
     if sess is not None:  # a run is open on its computer
         st = sess.get("state")
         if unattended or st in ("running", "working"):  # claude -p, or busy
-            return (f"working{'.' * (tick % 4):<3} · since {when}", "", None)
+            return (f"working{'.' * (tick % 4):<3} · {tail}", "", None)
         if due:  # the next run is owed but this one was never finished
-            return (f"finish it · since {when}", AMBER, "to finish")
+            return (f"finish it · {tail}", AMBER, "to finish")
         if not sess["agent"]:
             return ("check it · no claude", RED, "to check")  # claude didn't start
         if st == "waiting":  # claude asked you something
-            return (f"answer it · since {when}", _ASK, "to answer")
+            return (f"answer it · {tail}", _ASK, "to answer")
         if not opened:  # finished its turn, and you haven't looked yet
-            return (f"read it · since {when}", AMBER, "to read")
-        return (f"close it · since {when}", "dim", None)  # read; d marks it done
+            return (f"read it · {tail}", AMBER, "to read")
+        return (f"close it · {tail}", "dim", None)  # read; d marks it done
     if not sched_ok:
         return ("fix schedule", RED, None)
-    if not enabled:
+    if not enabled:  # paused: still say how its last run went
+        if done_at and exit_code:
+            return (f"failed {_day(done_at, now)} · paused", RED, None)
+        if done_at:
+            return (f"done {_day(done_at, now)} ✓ · paused", "dim", None)
         return ("paused", "dim", None)
     if failed:
         return ("couldn't start", RED, None)  # retried; the card says why
