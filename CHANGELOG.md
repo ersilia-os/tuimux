@@ -4,6 +4,7 @@
 
 - **Routines**: Claude prompts on a schedule, each on a fixed computer, run from the dashboard (`v` shows them). Grouped by computer; THIS RUN says whether the current period's run happened.
 - **Unattended routines** (`mode = "unattended"`) run `claude -p` with an `allow` list of tools, close themselves, and show `done` or `failed`. A MODE column shows which kind each routine is.
+- THIS RUN says what to do and since when (`answer it · since Mon`, `read it`, `done Mon ✓`, `scheduled`); amber means it waits on you, red that something broke, and only a question blinks.
 - A calmer graphite look, with the sessions and routines columns aligned.
 - More responsive over high-latency tailnets.
 - The dashboard's settings (`TUIMUX_REFRESH`, the timeouts, `TUIMUX_PERSIST`, …) now work from `~/.config/tuimux/config` too, not only as environment variables.

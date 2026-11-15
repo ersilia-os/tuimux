@@ -133,19 +133,45 @@ def _keep_cursor(old_meta, meta, prev):
 
 
 def _pending_note(pending):
-    """ "1 waiting · 2 unopened" from ``{word: count}``; empty if nothing."""
+    """ "1 to answer · 2 to read" from ``{todo: count}``; empty if nothing."""
     return "  ·  ".join(f"{n} {word}" for word, n in pending.items())
 
 
 def _routine_summary(total, pending):
     """The routines panel's border note: how many, and which open runs wait on
-    you (``{word: count}``, e.g. ``{"waiting": 1}``)."""
+    you (``{todo: count}``, e.g. ``{"to answer": 1}``)."""
     if not total:
         return ""
     note = f"{total} routine{'' if total == 1 else 's'}"
     if pending:
         note += f":  [bold {AMBER}]{_pending_note(pending)}[/]"
     return note
+
+
+def _day(t, now):
+    """A short date for the THIS RUN column, relative to `now`.
+
+    Parameters
+    ----------
+    t, now : float
+        Epoch seconds.
+
+    Returns
+    -------
+    str
+        "09:00" for today, "Mon" within the last six days, else "9 Nov".
+    """
+    d, today = datetime.fromtimestamp(t), datetime.fromtimestamp(now)
+    if d.date() == today.date():
+        return d.strftime("%H:%M")
+    if 0 < (today.date() - d.date()).days < 7:
+        return d.strftime("%a")
+    return d.strftime("%-d %b")
+
+
+# What makes a routine row amber: an open run that waits on you. Only "answer it"
+# blinks — Claude is stuck until you reply; the rest can wait for a glance.
+_ASK = f"blink bold {AMBER}"
 
 
 def _routine_status(
@@ -156,57 +182,78 @@ def _routine_status(
     due,
     live,
     probed,
-    done_ago=None,
+    since=None,
+    done_at=None,
     exit_code=None,
     unattended=False,
     failed=False,
     launching=False,
     opened=False,
+    now=None,
     tick=0,
 ):
     """Where the run for the current period stands (the THIS RUN column).
 
-    `done_ago` is how long ago the latest run finished ("2d ago"), or None if
-    it hasn't. When nothing is due, a finished latest run is this period's.
-    An `unattended` run never waits on you: while its session is open it is
-    running, and a non-zero `exit_code` marks the finished run as failed.
+    Each word says what to do about the run, and since when. Amber means it
+    waits on you, red means something broke, everything else is plain or dim.
+
+    Parameters
+    ----------
+    sched_ok, enabled : bool
+        Whether the schedule parses, and whether the routine is paused.
+    sess : dict or None
+        The run's open session (from the probe), or None.
+    due : bool
+        Whether a run is owed now.
+    live, probed : bool
+        Whether its computer answers now, and whether we know either way.
+    since, done_at : float or None
+        When the current run started, and when it finished (epoch seconds).
+    exit_code : int or None
+        An unattended run's exit code; non-zero means it failed.
+    unattended, failed, launching, opened : bool
+        Runs alone; couldn't start; is starting now; you have joined it.
+    now : float
+        Epoch seconds, for the dates.
+    tick : int
+        Animation frame, for the "working…" dots.
 
     Returns
     -------
     tuple
-        ``(word, color, pending)``. An open run uses the sessions table's
-        words (running, waiting, idle), plus "unopened" until you first join
-        it. `pending` means that open run waits on you (to answer, open or
-        close it): it blinks, and is counted on the panels' borders.
+        ``(word, style, todo)``. `todo` names what an open run waits on you
+        for ("to answer", "to read", …) and is counted on the panels' borders;
+        None when it doesn't need you.
     """
-    if sess is not None and unattended:  # claude -p, until its session closes
-        return ("running" + "." * (tick % 4), GREEN, False)
+    now = now or time.time()
+    when = _day(since, now) if since else "—"
     if sess is not None:  # a run is open on its computer
+        st = sess.get("state")
+        if unattended or st in ("running", "working"):  # claude -p, or busy
+            return (f"working{'.' * (tick % 4):<3} · since {when}", "", None)
         if due:  # the next run is owed but this one was never finished
-            return ("overdue", AMBER, True)
+            return (f"finish it · since {when}", AMBER, "to finish")
         if not sess["agent"]:
-            return ("no claude", RED, True)  # claude didn't start in it
-        st = sess["state"]
-        if st in ("running", "working"):
-            return ("running" + "." * (tick % 4), GREEN, False)
+            return ("check it · no claude", RED, "to check")  # claude didn't start
         if st == "waiting":  # claude asked you something
-            return ("waiting", AMBER, True)
-        if not opened:  # started, and you haven't looked at it yet
-            return ("unopened", AMBER, True)
-        return ("idle", "", False)
+            return (f"answer it · since {when}", _ASK, "to answer")
+        if not opened:  # finished its turn, and you haven't looked yet
+            return (f"read it · since {when}", AMBER, "to read")
+        return (f"close it · since {when}", "dim", None)  # read; d marks it done
     if not sched_ok:
-        return ("bad schedule", RED, False)
+        return ("fix schedule", RED, None)
     if not enabled:
-        return ("paused", "dim", False)
+        return ("paused", "dim", None)
     if failed:
-        return ("failed", RED, False)  # retried; the card says why
+        return ("couldn't start", RED, None)  # retried; the card says why
     if launching or (due and live):
-        return ("starting", GREEN, False)
-    if due:
-        # its computer is off (amber), or still being checked (dim)
-        return ("not run yet", AMBER if probed else "dim", False)
-    if done_ago and exit_code:
-        return (f"failed {done_ago}", RED, False)  # the card says how
-    if done_ago:
-        return (f"done {done_ago}", GREEN, False)
-    return ("not yet", "dim", False)
+        return ("starting…", "", None)
+    if due:  # its computer is off, or still being checked
+        if probed:
+            return ("missed · computer off", AMBER, None)
+        return ("due · checking…", "dim", None)
+    if done_at and exit_code:
+        return (f"failed {_day(done_at, now)}", RED, None)  # the card says how
+    if done_at:
+        return (f"done {_day(done_at, now)} ✓", "dim", None)
+    return ("scheduled", "dim", None)
