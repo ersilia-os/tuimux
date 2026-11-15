@@ -14,9 +14,10 @@ import calendar
 import json
 import os
 import re
-import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+
+import tomllib
 
 REGISTRY = os.path.expanduser("~/.config/tuimux/routines.toml")
 STATE = os.path.expanduser("~/.cache/tuimux/routines.json")

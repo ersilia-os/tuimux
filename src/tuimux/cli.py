@@ -51,7 +51,7 @@ def _maybe_first_run() -> None:
     try:
         env = {**os.environ, "TUIMUX_BIN": tuimux_bin()}
         subprocess.run(["bash", engine_path(), "__firstrun"], env=env, timeout=30)
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         pass  # never let setup hiccups block launching
 
 
