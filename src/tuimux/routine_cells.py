@@ -16,7 +16,6 @@ from .hosts import (
 )
 from .theme import (
     AMBER,
-    GREEN,
     RED,
 )
 
@@ -78,7 +77,7 @@ def _append_earlier(body, runs):
         if x["failed"]:
             body.append("✕", RED)
         elif x["done"] is not None:
-            body.append("✓", GREEN)
+            body.append("✓", "dim")
         else:
             body.append("●", "dim")
         body.append(datetime.fromtimestamp(x["start"]).strftime(" %-d %b"), "dim")

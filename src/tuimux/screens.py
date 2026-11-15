@@ -25,7 +25,6 @@ from textual.widgets.option_list import Option
 from . import routines
 from .theme import (
     AMBER,
-    GREEN,
     RED,
 )
 
@@ -351,7 +350,7 @@ class RoutineForm(ModalScreen[dict]):
             return  # the form closed, or you picked another computer meanwhile
         label = self.query_one("#f-claude", Label)
         if where:
-            label.update(Text("✓ claude found", GREEN))
+            label.update(Text("✓ claude found", "dim"))
         elif where == "":
             label.update(Text(f"✕ no claude on {host}", RED))
         else:

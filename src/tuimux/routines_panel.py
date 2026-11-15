@@ -30,8 +30,7 @@ from .routine_cells import (
     _routine_summary,
 )
 from .theme import (
-    AMBER,
-    GREEN,
+    STEEL,
     _marker,
 )
 
@@ -145,7 +144,7 @@ class RoutinesPanel:
         if sched is None or not r["enabled"]:
             nxt = ("—", "dim")
         elif due:
-            nxt = ("now", f"bold {GREEN}")
+            nxt = ("now", "bold")
         else:
             nowdt = datetime.fromtimestamp(now)
             t = routines.next_slot(sched, nowdt, routines.base_time(entry))
@@ -184,7 +183,7 @@ class RoutinesPanel:
         )
         return (
             (dot, (host, f"bold {accent}".strip())),
-            ((state, AMBER if state == "offline" else "dim"),),
+            ((state, "dim italic" if state in ("offline", "checking…") else "dim"),),
             (),
             (),
             (),
@@ -339,7 +338,7 @@ class RoutinesPanel:
                     (f"  ·  {n} routine{'' if n == 1 else 's'}", "dim"),
                     (f"  ·  {self._host_state(here[1])}\n", "dim"),
                     ("Press ", "dim"),
-                    ("n", f"bold {AMBER}"),
+                    ("n", f"bold {STEEL}"),
                     (" to add one here.", "dim"),
                 )
             )
@@ -350,7 +349,7 @@ class RoutinesPanel:
                     ("No routines yet.", "bold"),
                     "  Claude prompts that run on a schedule, each on one computer.\n",
                     ("Press ", "dim"),
-                    ("n", f"bold {AMBER}"),
+                    ("n", f"bold {STEEL}"),
                     (" to add one.", "dim"),
                 )
             )

@@ -17,7 +17,6 @@ from .theme import (
     _STATE_STYLE,
     AGENT,
     AMBER,
-    GREEN,
     MUTED,
     SESSION_COLUMNS,
     _marker,
@@ -151,18 +150,7 @@ class SessionsView:
     # Build the table as plain data — a list of (cells, meta) rows — so we can
     # diff cheaply and only repaint when something actually changed.
     #
-    # Colour & emphasis convention (keep consistent when editing styles here):
-    #   accent → the device's own colour, used as the identity thread: its machine
-    #            NAME/STATUS *and* its session NAMEs. Within a device block this is
-    #            the only hue — so each device reads as one calm colour family.
-    #   bold   → the machine (device) NAME and its status dot (the dot is always
-    #            bold; green=ssh, orange=online/no-ssh, hollow=offline). Nothing
-    #            else is bold — not the STATUS word, not session names.
-    #   amber  → the one thing that wants you: an agent STATE of "waiting" (plus
-    #            keep-awake / no-ssh markers). Kept rare so it actually pops.
-    #   blue → "claude" inside the TABS column (the active window is an AI agent).
-    #   dim    → everything else: metadata (folder, tabs, uptime, OPEN IN, USER),
-    #            idle/transient sessions, offline/"checking…" machines, hints.
+    # Colours follow the one convention in theme.py, shared with the routines panel.
     def _view(self):
         # Two buckets: the machines you can use right now (local + reachable, any
         # owner) go on TOP; everything else (your own phones/offline boxes, and —
@@ -288,14 +276,13 @@ class SessionsView:
 
     def _reachable_rows(self, machine, hdr, key, info, accent, is_local, ident):
         """A machine you can use: its header, its sessions, and "＋ new session"."""
-        # reachable — the NAME carries the machine's accent (local = teal;
-        # each remote its own colour, matching the tmux bar), but the STATUS
-        # is a consistent green "usable" signal, not the per-host accent.
+        # reachable — the NAME carries the machine's colour (matching its tmux
+        # bar); the green dot says it's usable, so the STATUS word stays dim.
         host, login = key
         # remembered from the last run, not yet re-probed: same rows, dimmed
         stale = info.get("stale", False)
-        word = ("local" if is_local else "online", GREEN)
-        awake_c = (("☕ awake", AMBER),) if info["awake"] else ()
+        word = ("local" if is_local else "online", "dim")  # the green dot says it
+        awake_c = (("☕ awake", ""),) if info["awake"] else ()
         if self._pending_for(host, login, None):
             awake_c = ((_PENDING_LABEL["awake"], "dim italic"),)
         rows = [
@@ -312,9 +299,7 @@ class SessionsView:
         rec = self._reconcile.get(key)
         verdicts = rec[1] if rec and time.monotonic() - rec[0] < RECONCILE_TTL else {}
         for s in info["sessions"]:  # its sessions, indented beneath it
-            rows.append(
-                self._session_row(key, s, accent, stale, verdicts.get(s["name"]))
-            )
+            rows.append(self._session_row(key, s, stale, verdicts.get(s["name"])))
         # Sessions that were here before the host dropped but didn't come
         # back — the host was shut down / tmux restarted, so they're gone.
         live = {s["name"] for s in info["sessions"]}
@@ -336,7 +321,7 @@ class SessionsView:
         )
         return rows
 
-    def _session_row(self, key, s, color, stale, verdict):
+    def _session_row(self, key, s, stale, verdict):
         """One live session's row, under its machine."""
         host, login = key
         # `open` means "we have a confirmed local tab to jump to" — the same
@@ -344,12 +329,11 @@ class SessionsView:
         # the menu honestly offers a new tab instead of promising focus the
         # engine can't deliver.
         locs = self._window_locs(s["name"])
-        # Session name carries the device accent (never bold — only the
-        # machine name is). Dim when it's just an idle, unattached shell.
-        if stale or (s["state"] == "idle" and not s["attached"]):
-            nm_style = "dim"
-        else:
-            nm_style = color
+        # Session names are plain (only the machine's name carries its colour),
+        # dim when it's just an idle, unattached shell.
+        nm_style = (
+            "dim" if stale or (s["state"] == "idle" and not s["attached"]) else ""
+        )
         # "running" gets a live ellipsis (running / running. / running.. /
         # running…) that cycles on the animation tick — a quiet sign of
         # activity. Other states are static.
@@ -362,7 +346,7 @@ class SessionsView:
             state_c = ((_PENDING_LABEL[pend[0]], "dim italic"),)
             if pend[1]:  # rename: show the new name right away
                 name_c = (("  ", ""), (pend[1], "dim italic"))
-        resumed = (("  resumed", GREEN),) if verdict == "resumed" else ()
+        resumed = (("  resumed", ""),) if verdict == "resumed" else ()
         return _row(
             {
                 "host": host,
