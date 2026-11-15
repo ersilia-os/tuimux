@@ -50,6 +50,17 @@ def _device_row(dead, hdr, status, lastseen, ident):
     return _row(dead, name=hdr("device", "dim"), status=(("device", MUTED),), **ident)
 
 
+def _warn_row(dead, hdr, word, hint, ident):
+    """An online machine you can't use right now: an amber word and a hint."""
+    return _row(
+        dead,
+        name=hdr("warn", f"bold {AMBER}"),
+        status=((word, AMBER),),
+        folder=((hint, "dim"),),
+        **ident,
+    )
+
+
 class SessionsView:
     """The sessions table's rows, built as plain data (mixed into Tuimux)."""
 
@@ -231,29 +242,13 @@ class SessionsView:
             ]
         if info.get("busy"):
             # SSH works, the host is just too loaded to answer in time.
-            return shown, [
-                _row(
-                    dead,
-                    name=hdr("warn", f"bold {AMBER}"),
-                    status=(("busy", AMBER),),
-                    folder=(("high load", "dim"),),
-                    **ident,
-                )
-            ]
+            return shown, [_warn_row(dead, hdr, "busy", "high load", ident)]
         if not info["reachable"]:
             # online on the tailnet, but no working SSH login. Your own box →
             # Tailscale SSH probably isn't enabled there; a teammate's box → you
             # have no account/permission on it. The hint says which to fix.
             hint = "tailscale up --ssh" if mine else "no account · press u"
-            return shown, [
-                _row(
-                    dead,
-                    name=hdr("warn", f"bold {AMBER}"),
-                    status=(("no ssh", AMBER),),
-                    folder=((hint, "dim"),),
-                    **ident,
-                )
-            ]
+            return shown, [_warn_row(dead, hdr, "no ssh", hint, ident)]
         rows = self._reachable_rows(machine, hdr, key, info, accent, is_local, ident)
         return shown, rows
 

@@ -337,31 +337,37 @@ def _parse_probe_lines(lines):
     for ln in lines:
         if ln == "__NOTMUX__":
             notmux = True
-            continue
-        if "|" not in ln:
-            continue
-        p = ln.split("|")
-        t = p[0]
-        try:
-            if t == "S":
-                S[p[1]] = {
-                    "attached": p[2] == "1",
-                    "windows": int(p[3] or 0),
-                    "dir": p[4] if len(p) > 4 else "",
-                    "cmd": p[5] if len(p) > 5 else "",
-                    "created": p[6] if len(p) > 6 else "",
-                }
-            elif t == "W":
-                W.setdefault(p[1], []).append((p[2], p[3], p[4] == "1"))
-            elif t == "L":
-                L.setdefault(p[1], []).append(p[2])  # one entry per attached client
-            elif t == "A":
-                A[p[1]] = p[2]
-            elif t == "C":
-                C.add(p[1])
-        except IndexError:
-            continue
+        elif "|" in ln:
+            try:
+                _take_record(ln.split("|"), S, W, L, A, C)
+            except IndexError:
+                continue
     return S, W, L, A, C, notmux
+
+
+def _take_record(p, S, W, L, A, C):
+    """File one probe record (already split on "|") into its kind's collection."""
+    t = p[0]
+    if t == "S":
+        S[p[1]] = {
+            "attached": p[2] == "1",
+            "windows": int(p[3] or 0),
+            "dir": p[4] if len(p) > 4 else "",
+            "cmd": p[5] if len(p) > 5 else "",
+            "created": p[6] if len(p) > 6 else "",
+        }
+        return
+    if t == "W":
+        W.setdefault(p[1], []).append((p[2], p[3], p[4] == "1"))
+        return
+    if t == "L":
+        L.setdefault(p[1], []).append(p[2])  # one entry per attached client
+        return
+    if t == "A":
+        A[p[1]] = p[2]
+        return
+    if t == "C":
+        C.add(p[1])
 
 
 def _session_info(name, s, wins, clients, agent_state, is_agent):
