@@ -11,12 +11,24 @@ import re
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from tuimux import app, routines  # noqa: E402
+from tuimux import (  # noqa: E402
+    app,
+    fmt,
+    preview,
+    routine_cells,
+    routines,
+    theme,
+)
+from tuimux import hosts as hostmod  # noqa: E402
+
+# every loaded tuimux module, so a stub reaches each module that looks a name up
+_MODULES = [m for n, m in sorted(sys.modules.items()) if n.startswith("tuimux.")]
 
 # Never touch the real routines registry or run state from a test.
 _RT = tempfile.mkdtemp(prefix="tuimux-routines-test-")
@@ -40,13 +52,16 @@ for _leak in (
 
 @contextlib.contextmanager
 def stub_engine(stdout):
-    """Make app._run return canned engine output instead of spawning bash."""
-    orig = app._run
-    app._run = lambda args, timeout=None: SimpleNamespace(stdout=stdout)
+    """Make every module's _run return canned engine output instead of spawning bash."""
+    mods = [m for m in _MODULES if hasattr(m, "_run")]
+    origs = [m._run for m in mods]
+    for m in mods:
+        m._run = lambda args, timeout=None: SimpleNamespace(stdout=stdout)
     try:
         yield
     finally:
-        app._run = orig
+        for m, orig in zip(mods, origs):
+            m._run = orig
 
 
 def _cell_text(cell):
@@ -59,19 +74,19 @@ def _cell_styles(cell):
 
 # ---- small pure helpers ------------------------------------------------------
 def test_abbrev_collapses_home():
-    assert app._abbrev("/Users/alice/code") == "~/code"
-    assert app._abbrev("/home/bob/x") == "~/x"
-    assert app._abbrev("/etc/hosts") == "/etc/hosts"
-    assert app._abbrev("") == ""
+    assert fmt._abbrev("/Users/alice/code") == "~/code"
+    assert fmt._abbrev("/home/bob/x") == "~/x"
+    assert fmt._abbrev("/etc/hosts") == "/etc/hosts"
+    assert fmt._abbrev("") == ""
 
 
 def test_uptime_buckets():
-    assert app._uptime(None) == ""
-    assert app._uptime("not-a-number") == ""
+    assert fmt._uptime(None) == ""
+    assert fmt._uptime("not-a-number") == ""
     now = int(app.time.time())
-    assert app._uptime(now - 120).endswith("m")
-    assert app._uptime(now - 7200).endswith("h")
-    assert app._uptime(now - 200000).endswith("d")
+    assert fmt._uptime(now - 120).endswith("m")
+    assert fmt._uptime(now - 7200).endswith("h")
+    assert fmt._uptime(now - 200000).endswith("d")
 
 
 def test_probe_counts_clients_per_session():
@@ -85,20 +100,20 @@ def test_probe_counts_clients_per_session():
         ]
     )
     with stub_engine(canned):
-        info = app.probe("host", "u")
+        info = hostmod.probe("host", "u")
     main = info["sessions"][0]
     assert main["attached"] is True and main["nclients"] == 2
 
 
 def test_auto_name():
     # a bare tmux number in a real folder → the folder's basename
-    assert app._auto_name("0", "~/code/ersilia", False, "zsh") == "ersilia"
+    assert fmt._auto_name("0", "~/code/ersilia", False, "zsh") == "ersilia"
     # numeric session running an agent → claude
-    assert app._auto_name("3", "~", True, "node") == "claude"
+    assert fmt._auto_name("3", "~", True, "node") == "claude"
     # numeric session running a non-shell command → that command
-    assert app._auto_name("3", "~", False, "vim") == "vim"
+    assert fmt._auto_name("3", "~", False, "vim") == "vim"
     # an explicitly named session is kept as-is
-    assert app._auto_name("build", "~", False, "zsh") == "build"
+    assert fmt._auto_name("build", "~", False, "zsh") == "build"
 
 
 def test_tuimux_bin_is_absolute_or_name():
@@ -108,7 +123,7 @@ def test_tuimux_bin_is_absolute_or_name():
 
 # ---- CLI: attach / detach (replaced the old `here`) -------------------------
 def test_here_command_is_gone_and_usage_advertises_attach_detach():
-    r = subprocess.run(["bash", app.ENGINE, "here"], capture_output=True, text=True)
+    r = subprocess.run(["bash", hostmod.ENGINE, "here"], capture_output=True, text=True)
     assert r.returncode == 1  # unknown command → usage + non-zero
     out = r.stdout + r.stderr
     assert "tuimux attach" in out and "tuimux detach" in out
@@ -118,7 +133,7 @@ def test_here_command_is_gone_and_usage_advertises_attach_detach():
 def test_detach_outside_tmux_is_friendly_noop():
     env = {k: v for k, v in os.environ.items() if k != "TMUX"}
     r = subprocess.run(
-        ["bash", app.ENGINE, "detach"], capture_output=True, text=True, env=env
+        ["bash", hostmod.ENGINE, "detach"], capture_output=True, text=True, env=env
     )
     assert r.returncode == 0  # not an error — just nothing to do
     assert "not inside a tmux session" in (r.stdout + r.stderr).lower()
@@ -127,7 +142,7 @@ def test_detach_outside_tmux_is_friendly_noop():
 # ---- CLI: autostart (auto-attach every new local terminal) ------------------
 def _autostart(action, rc):
     r = subprocess.run(
-        ["bash", app.ENGINE, "autostart", action],
+        ["bash", hostmod.ENGINE, "autostart", action],
         capture_output=True,
         text=True,
         env={**os.environ, "TUIMUX_RC": rc},
@@ -162,7 +177,7 @@ def _mouse(action, conf, tmpdir):
     # TMUX_TMPDIR points tmux at an empty socket dir, so the command's live
     # `tmux set -g mouse …` finds no server and can't touch a real one.
     r = subprocess.run(
-        ["bash", app.ENGINE, "mouse", action],
+        ["bash", hostmod.ENGINE, "mouse", action],
         capture_output=True,
         text=True,
         env={**os.environ, "TUIMUX_TMUX_CONF": conf, "TMUX_TMPDIR": tmpdir},
@@ -199,7 +214,7 @@ def test_mouse_state_command_reports_on_off():
 
         def state():
             return subprocess.run(
-                ["bash", app.ENGINE, "__mouse"],
+                ["bash", hostmod.ENGINE, "__mouse"],
                 capture_output=True,
                 text=True,
                 env={**os.environ, "TUIMUX_TMUX_CONF": conf, "TMUX_TMPDIR": d},
@@ -225,7 +240,10 @@ def test_settings_command_batches_autostart_and_mouse():
             "SHELL": "/bin/zsh",
         }
         out = subprocess.run(
-            ["bash", app.ENGINE, "__settings"], capture_output=True, text=True, env=env
+            ["bash", hostmod.ENGINE, "__settings"],
+            capture_output=True,
+            text=True,
+            env=env,
         ).stdout
         st = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
         assert set(st) == {"autostart", "mouse"}  # no tabcolor anymore
@@ -251,7 +269,7 @@ def test_first_run_enables_defaults_once_then_respects_off():
 
         def firstrun():
             subprocess.run(
-                ["bash", app.ENGINE, "__firstrun"],
+                ["bash", hostmod.ENGINE, "__firstrun"],
                 env=env,
                 capture_output=True,
                 text=True,
@@ -264,7 +282,7 @@ def test_first_run_enables_defaults_once_then_respects_off():
 
         # user turns autostart off; a later run must NOT re-enable it (marker guards)
         subprocess.run(
-            ["bash", app.ENGINE, "autostart", "off"],
+            ["bash", hostmod.ENGINE, "autostart", "off"],
             env=env,
             capture_output=True,
             text=True,
@@ -279,7 +297,7 @@ def test_autostart_bash_links_login_profile():
     # must remove both blocks. Force SHELL=bash and point both files at temps.
     def run(action, bashrc, profile):
         return subprocess.run(
-            ["bash", app.ENGINE, "autostart", action],
+            ["bash", hostmod.ENGINE, "autostart", action],
             capture_output=True,
             text=True,
             env={
@@ -319,7 +337,7 @@ def test_autostart_bash_skips_link_when_profile_already_sources_bashrc():
         with open(profile, "w") as f:
             f.write("[ -f ~/.bashrc ] && . ~/.bashrc\n")  # already sources it
         subprocess.run(
-            ["bash", app.ENGINE, "autostart", "on"],
+            ["bash", hostmod.ENGINE, "autostart", "on"],
             capture_output=True,
             text=True,
             env={
@@ -342,7 +360,7 @@ def test_autostart_state_reports_on_off_for_the_panel():
 
         def state():
             return subprocess.run(
-                ["bash", app.ENGINE, "__autostart"],
+                ["bash", hostmod.ENGINE, "__autostart"],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -391,7 +409,7 @@ def test_autostart_bakes_absolute_tuimux_path():
         rc = os.path.join(d, "rc")
         fake = "/opt/envs/tuimux/bin/tuimux"
         subprocess.run(
-            ["bash", app.ENGINE, "autostart", "on"],
+            ["bash", hostmod.ENGINE, "autostart", "on"],
             capture_output=True,
             text=True,
             env={**os.environ, "TUIMUX_RC": rc, "TUIMUX_BIN": fake},
@@ -402,7 +420,7 @@ def test_autostart_bakes_absolute_tuimux_path():
 
 def test_autoname_prints_a_two_word_name():
     r = subprocess.run(
-        ["bash", app.ENGINE, "__autoname"], capture_output=True, text=True
+        ["bash", hostmod.ENGINE, "__autoname"], capture_output=True, text=True
     )
     # docker-style "<adjective>-<scientist>", same generator tuimux uses elsewhere
     assert r.returncode == 0
@@ -417,7 +435,7 @@ def test_term_spawn_drops_skip_autostart_marker():
             [
                 "bash",
                 "-c",
-                f"source {app.ENGINE} __login >/dev/null 2>&1; "
+                f"source {hostmod.ENGINE} __login >/dev/null 2>&1; "
                 "linux_spawn(){ :; }; ghostty_spawn(){ :; }; terminal_spawn(){ :; }; "
                 "term_spawn tab bash x __attach h s attach",
             ],
@@ -444,7 +462,7 @@ CANNED = "\n".join(
 
 def test_probe_parses_sessions_awake_and_agent():
     with stub_engine(CANNED):
-        info = app.probe("host", "u")
+        info = hostmod.probe("host", "u")
     assert info["reachable"] is True
     assert info["busy"] is False
     assert info["awake"] is True  # the keep-awake helper session is present
@@ -459,19 +477,19 @@ def test_probe_parses_sessions_awake_and_agent():
 
 def test_probe_timeout_marks_busy_not_failed():
     with stub_engine("__TIMEOUT__\n"):
-        info = app.probe("host", "u")
+        info = hostmod.probe("host", "u")
     assert info["busy"] is True and info["reachable"] is False
 
 
 def test_probe_unreachable():
     with stub_engine("UNREACHABLE\n"):
-        info = app.probe("host", "u")
+        info = hostmod.probe("host", "u")
     assert info["reachable"] is False and info["busy"] is False
 
 
 def test_probe_keeps_raw_created_for_reconnect_identity():
     with stub_engine(CANNED):
-        info = app.probe("host", "u")
+        info = hostmod.probe("host", "u")
     # the raw session_created epoch is preserved (not just the formatted uptime),
     # so a reconnect can tell whether the very same session survived.
     assert all("created" in s for s in info["sessions"])
@@ -487,14 +505,14 @@ def test_reconcile_resumed_lost_and_quiet():
     old = [_sess("a", "100"), _sess("b", "200")]
     # a survived (same created), b is gone, c is brand new
     new = [_sess("a", "100"), _sess("c", "300")]
-    assert app._reconcile_sessions(old, new) == {"a": "resumed", "b": "lost"}
+    assert hostmod._reconcile_sessions(old, new) == {"a": "resumed", "b": "lost"}
     # same name but a new created → the old instance was lost (tmux restarted it)
-    assert app._reconcile_sessions([_sess("a", "100")], [_sess("a", "999")]) == {
+    assert hostmod._reconcile_sessions([_sess("a", "100")], [_sess("a", "999")]) == {
         "a": "lost"
     }
     # everything survived → all resumed (the happy reconnect case)
-    assert app._reconcile_sessions(old, old) == {"a": "resumed", "b": "resumed"}
-    assert app._reconcile_sessions([], []) == {}
+    assert hostmod._reconcile_sessions(old, old) == {"a": "resumed", "b": "resumed"}
+    assert hostmod._reconcile_sessions([], []) == {}
 
 
 # ---- view-model / rendering --------------------------------------------------
@@ -568,8 +586,8 @@ def test_consumer_devices_show_status_only():
 def test_consumer_devices_sorted_last():
     raw = "comp\t0\toffline\t2h\tcompute\nphone\t0\tonline\t\tconsumer\nme\t1\tonline\t\tcompute\n"
     with stub_engine(raw):
-        hosts = app.fetch_hosts()
-    assert [h[0] for h in hosts] == ["comp", "me", "phone"]
+        found = hostmod.fetch_hosts()
+    assert [h[0] for h in found] == ["comp", "me", "phone"]
 
 
 def test_view_bold_only_on_identifiers():
@@ -668,7 +686,7 @@ def test_view_row_meta_actions():
 
 
 # ---- offline "paused" sessions + reconnect verdicts -------------------------
-_OPEN_IN = app._COLS.index("open_in")
+_OPEN_IN = theme._COLS.index("open_in")
 
 
 def _snap_session(name, created="100", state="running"):
@@ -749,7 +767,7 @@ def test_reconnect_verdicts_age_out_after_ttl():
             "sessions": [live],
         }
     }
-    stale = app.time.monotonic() - app.RECONCILE_TTL - 1
+    stale = app.time.monotonic() - hostmod.RECONCILE_TTL - 1
     reconcile = {"rem": (stale, {"build": "resumed", "gone": "lost"})}
     rows = _view_for(hosts, results, reconcile=reconcile)
     # past the TTL: no "resumed" badge, no transient "lost" row
@@ -875,8 +893,8 @@ def test_waiting_agent_is_amber_working_is_not():
     for c, m in rows:
         if m.get("session") in ("w", "k"):
             state[m["session"]] = _cell_styles(c[2])
-    assert app.AMBER in state["w"]  # waiting wants you → amber
-    assert app.AMBER not in state["k"]  # working is calm
+    assert theme.AMBER in state["w"]  # waiting wants you → amber
+    assert theme.AMBER not in state["k"]  # working is calm
 
 
 # ---- run(): tuimux must never nest inside tmux ------------------------------
@@ -930,7 +948,7 @@ def _engine_dry(args, env=None):
     if env:
         e.update(env)
     return subprocess.run(
-        ["bash", app.ENGINE, *args], capture_output=True, text=True, env=e
+        ["bash", hostmod.ENGINE, *args], capture_output=True, text=True, env=e
     ).stdout
 
 
@@ -941,7 +959,7 @@ def test_linux_gnome_tab():
     )
     assert (
         out.strip()
-        == f"[dry-run] gnome-terminal --tab -- bash {app.ENGINE} __attach macmini mduran main attach"
+        == f"[dry-run] gnome-terminal --tab -- bash {hostmod.ENGINE} __attach macmini mduran main attach"
     )
 
 
@@ -972,7 +990,7 @@ def test_linux_generic_terminal_window_only():
     )
     assert (
         out.strip()
-        == f"[dry-run] alacritty -e bash {app.ENGINE} __attach macmini mduran main new"
+        == f"[dry-run] alacritty -e bash {hostmod.ENGINE} __attach macmini mduran main new"
     )
 
 
@@ -995,7 +1013,7 @@ def _engine_func(call, env=None, stubs=""):
     if env:
         e.update(env)
     script = (
-        f"source {app.ENGINE} __login >/dev/null 2>&1; "
+        f"source {hostmod.ENGINE} __login >/dev/null 2>&1; "
         "osascript(){ return 0; }; "  # never drive the GUI in tests
         f"{stubs}{call}"
     )
@@ -1080,13 +1098,13 @@ def test_preview_tail_trims_trailing_blanks_and_keeps_newest():
     # A tmux pane pads empty rows below the prompt; the preview drops them so the
     # last real line lands at the bottom, and keeps only the newest `height`.
     raw = "line1\nline2\nline3\nprompt $ \n\n\n"
-    assert app._preview_tail(raw, 10) == ["line1", "line2", "line3", "prompt $ "]
-    assert app._preview_tail(raw, 2) == ["line3", "prompt $ "]
+    assert fmt._preview_tail(raw, 10) == ["line1", "line2", "line3", "prompt $ "]
+    assert fmt._preview_tail(raw, 2) == ["line3", "prompt $ "]
 
 
 def test_preview_tail_empty_capture_is_empty_list():
-    assert app._preview_tail("", 12) == []
-    assert app._preview_tail("\n\n  \n", 12) == []
+    assert fmt._preview_tail("", 12) == []
+    assert fmt._preview_tail("\n\n  \n", 12) == []
 
 
 def test_peek_with_missing_args_is_an_empty_noop():
@@ -1094,7 +1112,7 @@ def test_peek_with_missing_args_is_an_empty_noop():
     # session to point at (e.g. cursor on a machine header) — it just returns
     # nothing, which the UI renders as an empty preview.
     r = subprocess.run(
-        ["bash", app.ENGINE, "__peek", "somehost"],
+        ["bash", hostmod.ENGINE, "__peek", "somehost"],
         capture_output=True,
         text=True,
     )
@@ -1127,7 +1145,7 @@ def _engine_eval(call, env=None, scope=None):
         e["TUIMUX_SCOPE"] = scope
     if env:
         e.update(env)
-    script = f"source {app.ENGINE} __login >/dev/null 2>&1; {_TS_STUB} {call}"
+    script = f"source {hostmod.ENGINE} __login >/dev/null 2>&1; {_TS_STUB} {call}"
     return subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, env=e
     ).stdout
@@ -1139,7 +1157,7 @@ def _engine_out(args, env=None):
     if env:
         e.update(env)
     return subprocess.run(
-        ["bash", app.ENGINE, *args], capture_output=True, text=True, env=e
+        ["bash", hostmod.ENGINE, *args], capture_output=True, text=True, env=e
     ).stdout
 
 
@@ -1174,7 +1192,7 @@ def test_login_cli_set_list_rm_and_validation():
         # an invalid token is rejected and leaves the config untouched
         before = Path(cfg).read_text()
         r = subprocess.run(
-            ["bash", app.ENGINE, "login", "foo", "bad user"],
+            ["bash", hostmod.ENGINE, "login", "foo", "bad user"],
             capture_output=True,
             text=True,
             env={**os.environ, **env},
@@ -1284,8 +1302,8 @@ def test_view_user_column_shows_owner_and_login():
         "pujarnol": {**base, "reachable": True, "sessions": []},
     }
     rows = _view_org(hosts, results)
-    owner_col = app._COLS.index("owner")
-    user_col = app._COLS.index("user")
+    owner_col = theme._COLS.index("owner")
+    user_col = theme._COLS.index("user")
 
     def cells_of(label):
         return next(c for c, _ in rows if label in _cell_text(c[0]))
@@ -1339,7 +1357,7 @@ def test_tabs_cell_tints_claude():
     tc = app.Tuimux._tabs_cell
     assert tc("1  zsh") == (("1  zsh", "dim"),)
     agent = tc("2  claude")
-    assert agent[-1] == ("claude", app.AGENT)  # command tinted blue
+    assert agent[-1] == ("claude", theme.AGENT)  # command tinted blue
     assert "dim" in agent[0][1]  # the count stays dim
 
 
@@ -1362,9 +1380,9 @@ def test_status_dot_color_tracks_connection():
             dot[m["host"]] = next(
                 (t.strip(), st) for t, st in cells[0] if t.strip() in ("●", "○")
             )
-    assert dot["ok"] == ("●", f"bold {app.GREEN}")  # reachable over SSH → green
-    assert dot["noss"] == ("●", f"bold {app.AMBER}")  # online, no SSH → orange
-    assert dot["off"] == ("○", f"bold {app.MUTED}")  # offline → hollow gray
+    assert dot["ok"] == ("●", f"bold {theme.GREEN}")  # reachable over SSH → green
+    assert dot["noss"] == ("●", f"bold {theme.AMBER}")  # online, no SSH → orange
+    assert dot["off"] == ("○", f"bold {theme.MUTED}")  # offline → hollow gray
 
 
 def test_offline_host_with_probe_zero_renders_offline():
@@ -1495,7 +1513,7 @@ def test_login_cli_rejects_duplicate_user_list():
         cfg = os.path.join(d, "config")
         before = Path(cfg).read_text() if os.path.exists(cfg) else ""
         r = subprocess.run(
-            ["bash", app.ENGINE, "login", "splunk", "a,a"],
+            ["bash", hostmod.ENGINE, "login", "splunk", "a,a"],
             capture_output=True,
             text=True,
             env={**os.environ, "TUIMUX_CONFIG": cfg, "USER": "miquel"},
@@ -1583,7 +1601,7 @@ def test_view_secondary_login_is_a_subrow_with_its_own_sessions():
     assert m1["login"] == "mduran" and g1["login"] == "gturon"
     # the secondary header is a sub-row of the machine (not marked primary): it
     # groups under the host in NAME and carries its login in the SSH USER column.
-    user_col = app._COLS.index("user")
+    user_col = theme._COLS.index("user")
     sub = next(
         c for c, m in rows if m.get("action") == "machine" and not m.get("primary")
     )
@@ -1592,27 +1610,27 @@ def test_view_secondary_login_is_a_subrow_with_its_own_sessions():
 
 
 def test_folder_cell_shows_last_component():
-    assert app._folder("~/Documents/GitHub/tuimux") == "tuimux"
-    assert app._folder("/var/log/") == "log"
-    assert app._folder("~") == "~"
-    assert app._folder("/") == "/"
-    assert app._folder("") == "~"
+    assert fmt._folder("~/Documents/GitHub/tuimux") == "tuimux"
+    assert fmt._folder("/var/log/") == "log"
+    assert fmt._folder("~") == "~"
+    assert fmt._folder("/") == "/"
+    assert fmt._folder("") == "~"
 
 
 def test_tabs_cell_drops_lone_window_count():
     # single window → just the command, no "1" prefix; violet when it's claude
     assert app.Tuimux._tabs_cell("zsh") == (("zsh", "dim"),)
-    assert app.Tuimux._tabs_cell("claude") == (("claude", app.AGENT),)
+    assert app.Tuimux._tabs_cell("claude") == (("claude", theme.AGENT),)
     # multi-window keeps the count and still tints a claude command
     cell = app.Tuimux._tabs_cell("3  claude")
-    assert cell[0] == ("3  ", "dim") and cell[1] == ("claude", app.AGENT)
+    assert cell[0] == ("3  ", "dim") and cell[1] == ("claude", theme.AGENT)
 
 
 def test_waiting_state_blinks_running_and_idle_do_not():
-    assert "blink" in app._STATE_STYLE["waiting"]
-    assert app.AMBER in app._STATE_STYLE["waiting"]
-    assert "blink" not in app._STATE_STYLE["running"]
-    assert "blink" not in app._STATE_STYLE["idle"]
+    assert "blink" in theme._STATE_STYLE["waiting"]
+    assert theme.AMBER in theme._STATE_STYLE["waiting"]
+    assert "blink" not in theme._STATE_STYLE["running"]
+    assert "blink" not in theme._STATE_STYLE["idle"]
 
 
 # ---- access-based default view (scope filter) ------------------------------
@@ -1782,7 +1800,7 @@ def test_separator_only_under_o_divides_yours_from_others():
 
 def test_no_ssh_hint_adapts_to_owner():
     base = {"reachable": False, "busy": False, "notmux": False, "awake": False}
-    folder = app._COLS.index("folder")
+    folder = theme._COLS.index("folder")
     hosts = [
         ("mybox", True, "online", "", "compute", "me", "", True, "#111", "me", True),
         ("mine-x", False, "online", "", "compute", "me", "", True, "#222", "me", True),
@@ -1820,7 +1838,7 @@ def test_running_state_animates_ellipsis():
     hosts = [
         ("mybox", True, "online", "", "compute", "me", "", True, "#111", "me", True)
     ]
-    state_col = app._COLS.index("state")
+    state_col = theme._COLS.index("state")
 
     def state_word(sess_state, tick):
         a = app.Tuimux()
@@ -1870,7 +1888,7 @@ def test_kick_rechecks_failed_hosts_sparingly():
     assert key not in probed
 
     # known-unreachable but stale → rechecked
-    a._last_probe[key] = app.time.monotonic() - app.RECHECK - 1
+    a._last_probe[key] = app.time.monotonic() - hostmod.RECHECK - 1
     a._probing.clear()
     a._kick([host])
     assert key in probed
@@ -1988,7 +2006,7 @@ def test_host_shell_unreachable_host():
 def test_remote_prints_scripts_without_running_them():
     def script(*args):
         return subprocess.run(
-            ["bash", app.ENGINE, "__remote", *args], capture_output=True, text=True
+            ["bash", hostmod.ENGINE, "__remote", *args], capture_output=True, text=True
         )
 
     assert "tmux list-sessions" in script("probe").stdout
@@ -2009,35 +2027,35 @@ def fake_shell(result, me="me"):
             calls.append(script)
             return result
 
-    orig_pool, orig_script = app._pool, app._script
-    app._pool = lambda: SimpleNamespace(get=lambda h, lg: Shell())
-    app._script = lambda kind, *a: f"<{kind}{''.join(' ' + x for x in a)}>"
-    app._ENV["TUIMUX_SELF_HOST"] = me
+    orig_pool, orig_script = hostmod._pool, hostmod._script
+    hostmod._pool = lambda: SimpleNamespace(get=lambda h, lg: Shell())
+    hostmod._script = lambda kind, *a: f"<{kind}{''.join(' ' + x for x in a)}>"
+    hostmod._ENV["TUIMUX_SELF_HOST"] = me
     try:
         yield calls
     finally:
-        app._pool, app._script = orig_pool, orig_script
-        app._ENV.pop("TUIMUX_SELF_HOST", None)
+        hostmod._pool, hostmod._script = orig_pool, orig_script
+        hostmod._ENV.pop("TUIMUX_SELF_HOST", None)
 
 
 def test_probe_over_persistent_shell():
     body = CANNED.split("\n", 1)[1]
     with fake_shell((0, body)) as calls:
-        info = app.probe("remote-box", "u")
+        info = hostmod.probe("remote-box", "u")
     assert calls == ["<probe>"]
     assert info["reachable"] and [s["auto"] for s in info["sessions"]] == ["cl", "main"]
     with fake_shell((None, remote.TIMEOUT)):
-        assert app.probe("remote-box", "u")["busy"] is True
+        assert hostmod.probe("remote-box", "u")["busy"] is True
     with fake_shell((None, "")):
-        info = app.probe("remote-box", "u")
+        info = hostmod.probe("remote-box", "u")
     assert not info["reachable"] and not info["busy"]
 
 
 def test_actions_use_the_shell_remotely_and_the_engine_locally():
     with fake_shell((0, "")) as calls, stub_engine("") as _:
-        app.host_action("rename", "remote-box", "u", "old", "new")
+        hostmod.host_action("rename", "remote-box", "u", "old", "new")
         assert calls == ["<rename old new>"]
-        app.host_action("kill", "me", "u", "s")  # the local host: engine path
+        hostmod.host_action("kill", "me", "u", "s")  # the local host: engine path
         assert calls == ["<rename old new>"]
 
 
@@ -2135,22 +2153,39 @@ def test_stale_snapshot_rows_are_dim_but_actionable():
     assert "dim" in _cell_styles(cells[0])
 
 
+def test_quitting_closes_the_ssh_shells():
+    # the pool is created lazily inside hosts, so the app must read it live
+    closed = []
+    orig_pool, orig_save = hostmod._POOL, app.save_snapshot
+    hostmod._POOL = SimpleNamespace(close_all=lambda: closed.append(True))
+    app.save_snapshot = lambda *a: None
+    try:
+        app.Tuimux().on_unmount()
+    finally:
+        hostmod._POOL, app.save_snapshot = orig_pool, orig_save
+    assert closed == [True]
+
+
 def test_snapshot_round_trip_and_corrupt_file():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "sub", "snapshot.json")
         snap = {("box", "u"): [_live("s", created="0")]}
-        app.save_snapshot(path, [_ME, _BOX], snap, "routines")
-        hosts, got, panel = app.load_snapshot(path)
-        assert hosts == [_ME, _BOX] and panel == "routines"
+        hostmod.save_snapshot(path, [_ME, _BOX], snap, "routines")
+        saved, got, panel = hostmod.load_snapshot(path)
+        assert saved == [_ME, _BOX] and panel == "routines"
         assert [x["name"] for x in got[("box", "u")]] == ["s"]
         assert got[("box", "u")][0]["uptime"].endswith("d")  # recomputed
         with open(path, "w") as f:
             f.write("{not json")
-        assert app.load_snapshot(path) == ([], {}, "preview")
-        assert app.load_snapshot(os.path.join(d, "missing.json")) == ([], {}, "preview")
+        assert hostmod.load_snapshot(path) == ([], {}, "preview")
+        assert hostmod.load_snapshot(os.path.join(d, "missing.json")) == (
+            [],
+            {},
+            "preview",
+        )
         # a snapshot from before the panel existed (or a bad value) opens in preview
-        app.save_snapshot(path, [_ME], {}, "bogus")
-        assert app.load_snapshot(path)[2] == "preview"
+        hostmod.save_snapshot(path, [_ME], {}, "bogus")
+        assert hostmod.load_snapshot(path)[2] == "preview"
 
 
 def test_preview_cache_paints_on_return_and_prunes_closed_sessions():
@@ -2180,7 +2215,6 @@ def test_open_skips_the_focus_walk_when_not_open():
 
 
 # ---- routines -----------------------------------------------------------------
-from datetime import datetime  # noqa: E402
 
 
 def test_schedule_phrases_and_slots():
@@ -2261,7 +2295,17 @@ def test_launch_script_types_claude_and_keeps_the_prompt_exact():
             )
         os.chmod(fake, 0o755)
         script = subprocess.run(
-            ["bash", app.ENGINE, "__remote", "launch", "routine-t", "~", "t", "h", "u"],
+            [
+                "bash",
+                hostmod.ENGINE,
+                "__remote",
+                "launch",
+                "routine-t",
+                "~",
+                "t",
+                "h",
+                "u",
+            ],
             input=prompt,
             capture_output=True,
             text=True,
@@ -2353,7 +2397,7 @@ def test_routine_status_lifecycle():
         ({"done_ago": "1h ago", "exit_code": 3}, ("failed 1h ago", False)),
     ]
     for kw, (word, pending) in cases:
-        got = app._routine_status(**{**base, **kw})
+        got = routine_cells._routine_status(**{**base, **kw})
         assert (got[0], got[2]) == (word, pending), (kw, got)
 
 
@@ -2462,7 +2506,7 @@ def test_failed_start_backs_off_and_warns_once():
     assert _ticked(a) == []  # no retry on the next probe
     a._launched(r, "u", "__FAIL__ couldn't write the prompt file (disk full?)\n", False)
     assert len(toasts) == 1 and "disk full" in toasts[0]
-    a._failed["lit"] = (app.time.monotonic() - app.ROUTINE_RETRY - 1, "x")
+    a._failed["lit"] = (app.time.monotonic() - hostmod.ROUTINE_RETRY - 1, "x")
     assert _ticked(a) == [("lit", "u")]  # retried once the backoff has passed
 
 
@@ -2489,15 +2533,15 @@ def test_v_cycles_the_bottom_panel_and_remembers_it():
     a._sync_routine_detail = lambda: None
     a._sync_preview_target = lambda: None
     saved = []
-    orig = app.save_snapshot
-    app.save_snapshot = lambda path, hosts, snap, panel: saved.append(panel)
+    orig = preview.save_snapshot
+    preview.save_snapshot = lambda path, hosts, snap, panel: saved.append(panel)
     try:
         seen = []
         for _ in range(3):
             a.action_panel()
             seen.append((a._panel, a._preview.display, wrap.display, focused[-1]))
     finally:
-        app.save_snapshot = orig
+        preview.save_snapshot = orig
     assert seen == [
         ("routines", False, True, "routines"),  # routines: cursor goes into it
         ("none", False, False, "sessions"),  # none: sessions get the full height
@@ -2510,16 +2554,16 @@ def test_v_cycles_the_bottom_panel_and_remembers_it():
 def test_routine_detail_card():
     r = _routine(folder="~/repo", enabled=False, prompt="/lit\nmore")
     entry = routines.new_entry(0)
-    first, second = app._routine_detail(r, entry, now=1000).plain.split("\n")
+    first, second = routine_cells._routine_detail(r, entry, now=1000).plain.split("\n")
     assert first == "Daily · 09:00  ·  ~/repo  ·  /lit  ↵  more  ·  paused"
     assert second == "never run"
-    day = app.datetime.fromtimestamp(0).strftime("%-d %b")
+    day = datetime.fromtimestamp(0).strftime("%-d %b")
     routines.add_run(entry, 0, failed=True)
     routines.add_run(entry, 0)
     entry["runs"][-1].update(done=1500.0, outcome="12 new papers")
-    second = app._routine_detail(r, entry, now=9000).plain.split("\n")[1]
+    second = routine_cells._routine_detail(r, entry, now=9000).plain.split("\n")[1]
     assert second == f"last outcome: 12 new papers  ·  took 25m  ·  earlier: ✕ {day}"
-    failed = app._routine_detail(r, entry, "disk full").plain.split("\n")[1]
+    failed = routine_cells._routine_detail(r, entry, "disk full").plain.split("\n")[1]
     assert failed.startswith("couldn't start: disk full")
 
 
@@ -2544,7 +2588,7 @@ def test_routines_are_grouped_by_computer_in_tailnet_order():
         _routine(name="c", host="box"),
         _routine(name="d", host="me"),
     ]
-    groups = app._routine_groups(rs, [_BOX, _ME])
+    groups = routine_cells._routine_groups(rs, [_BOX, _ME])
     assert [(h, [r["name"] for r in g]) for h, g in groups] == [
         ("box", ["c"]),
         ("me", ["a", "d"]),
@@ -2560,14 +2604,16 @@ def test_cursor_on_a_header_row_selects_no_routine():
     a._rtable.cursor_row = 1
     assert a._cur_routine()["name"] == "lit"
     meta = [("host", "box"), ("routine", "lit")]
-    assert app._keep_cursor([], meta, 0) == 1  # lands on the first routine
-    assert app._keep_cursor(meta, [("host", "me")] + meta, 1) == 2  # follows it
+    assert routine_cells._keep_cursor([], meta, 0) == 1  # lands on the first routine
+    assert (
+        routine_cells._keep_cursor(meta, [("host", "me")] + meta, 1) == 2
+    )  # follows it
 
 
 def test_routines_panel_summary():
-    assert app._routine_summary(0, {}) == ""
-    assert app._routine_summary(1, {}) == "1 routine"
-    note = app._routine_summary(8, {"waiting": 1, "unopened": 2})
+    assert routine_cells._routine_summary(0, {}) == ""
+    assert routine_cells._routine_summary(1, {}) == "1 routine"
+    note = routine_cells._routine_summary(8, {"waiting": 1, "unopened": 2})
     assert note.startswith("8 routines:") and "1 waiting  ·  2 unopened" in note
 
 
@@ -2591,7 +2637,7 @@ def test_ask_done_hands_claude_the_finish_instruction_separately():
         return subprocess.run(
             [
                 "bash",
-                app.ENGINE,
+                hostmod.ENGINE,
                 "__remote",
                 "launch",
                 "routine-t",
@@ -2618,7 +2664,7 @@ def test_ask_done_hands_claude_the_finish_instruction_separately():
 
 def test_unattended_routine_runs_claude_in_print_mode_and_closes_itself():
     out = subprocess.run(
-        ["bash", app.ENGINE, "__remote", "launch", "routine-t", "~", "t", "h", "u"]
+        ["bash", hostmod.ENGINE, "__remote", "launch", "routine-t", "~", "t", "h", "u"]
         + ["1", "1", "Read,Bash(gh *)"],
         input="/literature-digest",
         capture_output=True,
@@ -2634,9 +2680,12 @@ def test_unattended_routine_runs_claude_in_print_mode_and_closes_itself():
 
 
 def test_outcome_read_carries_an_unattended_runs_exit_code():
-    assert app._parse_outcome("__EXIT__ 3\n12 new papers\n") == ("12 new papers", 3)
-    assert app._parse_outcome("\n  done fine \n") == ("done fine", None)
-    assert app._parse_outcome("") == ("", None)
+    assert routine_cells._parse_outcome("__EXIT__ 3\n12 new papers\n") == (
+        "12 new papers",
+        3,
+    )
+    assert routine_cells._parse_outcome("\n  done fine \n") == ("done fine", None)
+    assert routine_cells._parse_outcome("") == ("", None)
 
 
 def test_describe_reads_like_people_talk():
@@ -2684,7 +2733,7 @@ def test_done_run_fetches_and_keeps_its_outcome():
 def test_engine_outcome_and_claude_check_scripts():
     def engine(*args, inp=""):
         return subprocess.run(
-            ["bash", app.ENGINE, *args], input=inp, capture_output=True, text=True
+            ["bash", hostmod.ENGINE, *args], input=inp, capture_output=True, text=True
         ).stdout
 
     launch = engine(
@@ -2723,8 +2772,8 @@ def test_duplicate_opens_a_paused_copy():
 
 
 def test_next_run_shows_the_date():
-    assert app._when(app.datetime(2026, 2, 13, 8, 0)) == "Fri 13 Feb 08:00"
-    assert app._when(app.datetime(2026, 2, 10, 9, 40)) == "Tue 10 Feb 09:40"
+    assert fmt._when(datetime(2026, 2, 13, 8, 0)) == "Fri 13 Feb 08:00"
+    assert fmt._when(datetime(2026, 2, 10, 9, 40)) == "Tue 10 Feb 09:40"
 
 
 def test_routines_columns_line_up_with_the_sessions_columns():
@@ -2735,8 +2784,8 @@ def test_routines_columns_line_up_with_the_sessions_columns():
             x += w + 2  # each cell has 1 column of padding on both sides
         return out
 
-    sessions = starts(w for _, _, w in app.SESSION_COLUMNS)
-    routines = starts(app._span_width(keys) for _, _, keys in app.ROUTINE_COLUMNS)
+    sessions = starts(w for _, _, w in theme.SESSION_COLUMNS)
+    routines = starts(theme._span_width(keys) for _, _, keys in theme.ROUTINE_COLUMNS)
     assert set(routines) <= set(sessions)
 
 
@@ -2750,7 +2799,9 @@ def test_failed_unattended_run_is_kept_and_shown():
     entry["runs"][-1]["done"] = 200.0
     a._got_outcome("lit", 100.0, "couldn't reach the API", 1)
     assert entry["runs"][-1]["exit"] == 1
-    card = app._routine_detail(a._routines[0], entry, now=300).plain.split("\n")
+    card = routine_cells._routine_detail(a._routines[0], entry, now=300).plain.split(
+        "\n"
+    )
     assert "unattended" in card[0]
     assert card[1].startswith("failed (exit 1): couldn't reach the API")
     assert "routines/lit.log" in card[1]

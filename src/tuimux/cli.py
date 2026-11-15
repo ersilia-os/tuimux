@@ -8,6 +8,13 @@ from importlib.resources import files
 
 
 def engine_path() -> str:
+    """Path to the bundled bash engine.
+
+    Returns
+    -------
+    str
+        The absolute path of ``engine.sh`` inside the installed package.
+    """
     return str(files("tuimux").joinpath("engine.sh"))
 
 
@@ -51,7 +58,7 @@ def _maybe_first_run() -> None:
     try:
         env = {**os.environ, "TUIMUX_BIN": tuimux_bin()}
         subprocess.run(["bash", engine_path(), "__firstrun"], env=env, timeout=30)
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         pass  # never let setup hiccups block launching
 
 
@@ -62,6 +69,11 @@ def tuimux_bin() -> str:
     in a fresh login shell. If tuimux lives in a venv/conda env that isn't on
     the default PATH, the bare name ``tuimux`` won't resolve there and opening a
     session silently fails. Resolving to an absolute path makes it work anywhere.
+
+    Returns
+    -------
+    str
+        The absolute path, or ``"tuimux"`` if it can't be resolved.
     """
     cand = sys.argv[0] or ""
     if (
@@ -78,6 +90,11 @@ def tuimux_bin() -> str:
 
 
 def main() -> None:
+    """Run the ``tuimux`` command.
+
+    With no arguments, launch the dashboard; with any, replace this process with
+    the bash engine running them (``tuimux attach``, ``tuimux doctor``, …).
+    """
     args = sys.argv[1:]
     _require_tmux()  # nothing tuimux does makes sense without tmux
     _maybe_first_run()  # enable autostart + mouse scroll on the very first run

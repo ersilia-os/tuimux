@@ -171,6 +171,18 @@ class ShellPool:
 
         After `close_all`, returns a shell that can't connect, so a probe still
         in flight at exit can't leave a new ssh behind.
+
+        Parameters
+        ----------
+        host : str
+            The tailnet machine.
+        login : str
+            The SSH user ("" for the default).
+
+        Returns
+        -------
+        Shell
+            The persistent shell for that machine and user.
         """
         with self._lock:
             if self._closed:

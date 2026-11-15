@@ -12,7 +12,12 @@
 
 - `src/tuimux/cli.py` — the `tuimux` entry point. No arguments launches the dashboard; any subcommand is forwarded to the bash engine.
 - `src/tuimux/engine.sh` — the bash engine. It does discovery (`tailscale status`), probing over Tailscale SSH, tmux actions, and drives the local terminal emulator. It also implements every subcommand (`attach`, `detach`, `autostart`, `mouse`, `login`, `devices`, `doctor`) and the internal `__*` commands the dashboard calls.
-- `src/tuimux/app.py` — the Textual dashboard. It calls the engine and renders its output; `_view` is the view-model the tests exercise directly.
+- `src/tuimux/app.py` — the Textual dashboard: the `Tuimux` app, its lifecycle and rendering. It composes the panels below as mixins, and calls the engine through `hosts.py`.
+  - `hosts.py` — talking to machines: engine calls, SSH probes, host actions, snapshots. `fmt.py` — display formatting (ages, folders, session names).
+  - `theme.py` — palette, Textual theme, stylesheet, and the column grid both tables share.
+  - `sessions_view.py` — `_view`, the sessions table's view-model the tests exercise directly. `fleet.py` keeps hosts and probes fresh; `preview.py` mirrors the highlighted pane; `session_actions.py` holds the session keys.
+  - `routines_panel.py`, `routine_cells.py`, `routine_actions.py` — the routines panel: rendering and scheduling, its pure cell/status helpers, and its keys. `routines.py` is the registry and run state.
+  - `screens.py` — dialogs, the routine form, and the two `DataTable`s.
 - `config.example` — the authoritative list of `TUIMUX_*` settings. Keep it in sync when the engine gains or loses a setting.
 
 ## Deviations from the package standard
@@ -21,7 +26,8 @@
 
 ## Code style and quality
 
-- **Run ruff before every commit.** `ruff check` and `ruff format` must both pass.
+- **Run ruff before every commit.** `ruff check` and `ruff format` must both pass. `ruff.toml` is the canonical Ersilia config; `pre-commit install` runs it for you, and CI (`.github/workflows/ci.yml`) runs it and `pytest` on every PR.
+- **Keep modules under ~600 lines.** Add a mixin or a helper module rather than growing `app.py` back.
 - **Docstrings: NumPy convention.** Write succinct NumPy-style docstrings for every public class, function, and method. For private helpers, only add a docstring when the intent isn't obvious from the name and signature.
 - **Keep code, docstrings, and docs aligned.** When a subcommand or setting changes, update the engine's usage header, the README, and `config.example` in the same commit.
 

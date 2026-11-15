@@ -24,16 +24,16 @@ pip install git+https://github.com/ersilia-os/tuimux
 
 ## Usage
 
-```sh
-tuimux                              # the dashboard — all you normally need
-tuimux attach [name]                # put this terminal into a tmux session (attach or create)
-tuimux detach                       # detach this terminal; the session keeps running
-tuimux autostart on|off|status      # auto-tmux every new local terminal
-tuimux mouse on|off|status          # tmux mouse mode (wheel scrolls the pane)
-tuimux login [host user[,user…]]    # show/set the SSH user(s) per host
-tuimux devices                      # list every device in the tailnet
-tuimux doctor                       # check your setup
-```
+| Command | What it does |
+|---|---|
+| `tuimux` | the dashboard — all you normally need |
+| `tuimux attach [name]` | put this terminal into a tmux session (attach or create) |
+| `tuimux detach` | detach this terminal; the session keeps running |
+| `tuimux autostart on\|off\|status` | auto-tmux every new local terminal |
+| `tuimux mouse on\|off\|status` | tmux mouse mode (wheel scrolls the pane) |
+| `tuimux login [host user[,user…]]` | show/set the SSH user(s) per host |
+| `tuimux devices` | list every device in the tailnet |
+| `tuimux doctor` | check your setup |
 
 Open, rename, detach, close, and keep-awake all happen inside the dashboard. The footer lists the keys, and a live preview of the highlighted session shows under the table (`v` switches it to routines, or hides it).
 
