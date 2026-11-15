@@ -68,6 +68,21 @@ ROUTINE_COLUMNS = (
 )
 
 
+# Colour convention, the same in both panels (keep to it when adding styles):
+#   machine colour → a machine's NAME on its header row, in both tables (it
+#                    matches that machine's tmux status bar). Nothing under the
+#                    header is coloured: session and routine names are plain.
+#   green → only the status dot of a machine you can use (see _marker).
+#   amber → waits on you: Claude asked something, a run to read or finish, a
+#           box you can't SSH into yet. Only a question blinks.
+#   red   → broken: a failed run, no claude, a bad schedule.
+#   blue  → "claude" in the TABS column (AGENT).
+#   steel → keys and focus ($primary), e.g. a key named in a hint.
+#   plain → active (running, working, starting); dim → everything else:
+#           metadata, idle or offline, paused, done, scheduled.
+#   bold  → machine names, their dots, and the item a hint is about.
+
+
 def _marker(state):
     """The bold status dot in front of a machine's NAME — a traffic light for how
     reachable it is: ● green = usable (local / online over SSH), ● amber = online

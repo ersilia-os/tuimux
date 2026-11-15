@@ -849,7 +849,7 @@ def _session(name, **kw):
     }
 
 
-def test_session_rows_use_device_accent_and_dim_metadata():
+def test_session_rows_are_plain_and_only_the_machine_is_coloured():
     base = {"reachable": True, "busy": False, "notmux": False, "awake": False}
     hosts = [("rem", False, "online", "", "compute", "arnau", "", True, "#abcdef")]
     results = {
@@ -867,12 +867,13 @@ def test_session_rows_use_device_accent_and_dim_metadata():
     def cells_for(n):
         return next(c for c, _ in rows if n in _cell_text(c[0]))
 
-    # accent (never bold); idle+unattached → dim; attached/running → plain accent
-    att_name = _cell_styles(cells_for("att")[0])
-    assert "#abcdef" in att_name and "bold" not in att_name
+    # session names are plain, as routine names are; idle+unattached → dim. Only
+    # the machine's header carries its colour, in both panels.
+    assert _cell_styles(cells_for("att")[0]) == ""
     assert "dim" in _cell_styles(cells_for("idle1")[0])
-    run_name = _cell_styles(cells_for("run1")[0])
-    assert "#abcdef" in run_name and "bold" not in run_name
+    assert _cell_styles(cells_for("run1")[0]) == ""
+    header = rows[0][0]
+    assert "#abcdef" in _cell_styles(header[0]) and _cell_styles(header[1]) == "dim"
     # folder (col 4) is dim metadata now, not a fixed cyan
     assert _cell_styles(cells_for("att")[4]) == "dim"
 
