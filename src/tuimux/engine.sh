@@ -304,16 +304,6 @@ logins_for() {
   fi
 }
 
-# Just the host names that have an explicit login mapping (one per line). Used by
-# discovery so a mapped shared host always shows up even when it's owned by a
-# teammate (different tailnet owner).
-mapped_host_keys() {
-  local tok
-  for tok in $TUIMUX_LOGINS; do
-    case "$tok" in *=?*) printf '%s\n' "${tok%%=*}" ;; esac
-  done
-}
-
 # The EXPLICIT mapped login for a host, or empty if it has none. Unlike login_for
 # this never falls back to $USER — the dashboard uses the emptiness to tell a real
 # mapping ("connect as gturon") apart from the default.
@@ -385,23 +375,10 @@ offline_hosts() {
     }'
 }
 
-# Consumer devices (phones/tablets/TVs) only *consume* the tailnet — they never
-# run code, so we never SSH into them; the dashboard just shows online/offline
-# and parks them at the end of the list. Classify by the OS column ($4) of the
-# cached tailscale snapshot.
-host_os() {
-  ts_status | awk -v n="$1" '$2==n {print $4; exit}'
-}
 # Tailnet owner of a host (column 3, e.g. "arnau@"), trailing '@' stripped for
 # display. Empty if the host isn't in the snapshot.
 host_owner() {
   ts_status | awk -v n="$1" '$2==n {o=$3; sub(/@$/,"",o); print o; exit}'
-}
-is_consumer() {
-  case "$(host_os "$1" | tr '[:upper:]' '[:lower:]')" in
-    ios|android|androidtv|tvos) return 0 ;;
-    *) return 1 ;;
-  esac
 }
 
 # ----- session probe ---------------------------------------------------------
@@ -1759,8 +1736,6 @@ case "${1:-}" in
   __windows     ) list_windows ;;
   __selfwin     ) self_winid ;;
   __autoname    ) docker_name ;;
-  __autostart   ) autostart_state ;;
-  __mouse       ) mouse_state ;;
   __settings    ) printf 'autostart=%s\nmouse=%s\n' "$(autostart_state)" "$(mouse_state)" ;;
   __firstrun    ) first_run_setup ;;
   __console     ) open_console ;;

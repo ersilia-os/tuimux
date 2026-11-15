@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# Never read the real ~/.config/tuimux/config (the dashboard and engine both do).
+os.environ["TUIMUX_CONFIG"] = os.devnull
 
 from tuimux import (  # noqa: E402
     app,
@@ -208,17 +210,21 @@ def test_mouse_on_off_status_and_idempotency():
         assert "off" in _mouse("status", conf, d)
 
 
+def _settings(env):
+    """The engine's ``__settings`` read, as a dict (autostart, mouse)."""
+    out = subprocess.run(
+        ["bash", hostmod.ENGINE, "__settings"], capture_output=True, text=True, env=env
+    ).stdout
+    return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+
+
 def test_mouse_state_command_reports_on_off():
     with tempfile.TemporaryDirectory() as d:
         conf = os.path.join(d, "tmux.conf")
 
         def state():
-            return subprocess.run(
-                ["bash", hostmod.ENGINE, "__mouse"],
-                capture_output=True,
-                text=True,
-                env={**os.environ, "TUIMUX_TMUX_CONF": conf, "TMUX_TMPDIR": d},
-            ).stdout.strip()
+            env = {**os.environ, "TUIMUX_TMUX_CONF": conf, "TMUX_TMPDIR": d}
+            return _settings(env)["mouse"]
 
         assert state() == "off"
         _mouse("on", conf, d)
@@ -353,18 +359,13 @@ def test_autostart_bash_skips_link_when_profile_already_sources_bashrc():
 
 
 def test_autostart_state_reports_on_off_for_the_panel():
-    # `__autostart` is the machine-readable on/off the dashboard shows in its border.
+    # `__settings` gives the machine-readable on/off the dashboard shows in its border.
     with tempfile.TemporaryDirectory() as d:
         rc = os.path.join(d, "rc")
         env = {**os.environ, "TUIMUX_RC": rc}
 
         def state():
-            return subprocess.run(
-                ["bash", hostmod.ENGINE, "__autostart"],
-                capture_output=True,
-                text=True,
-                env=env,
-            ).stdout.strip()
+            return _settings(env)["autostart"]
 
         assert state() == "off"
         _autostart("on", rc)
@@ -2153,6 +2154,37 @@ def test_stale_snapshot_rows_are_dim_but_actionable():
     assert "dim" in _cell_styles(cells[0])
 
 
+def test_dashboard_settings_come_from_the_config_file_too():
+    with tempfile.TemporaryDirectory() as d:
+        cfg = os.path.join(d, "config")
+        with open(cfg, "w") as f:
+            f.write(
+                "# a comment\n"
+                "TUIMUX_REFRESH=7   # seconds\n"
+                'export TUIMUX_PERSIST="off"\n'
+                "TUIMUX_QUIET='2.5'\n"
+                "NOT_OURS=1\n"
+            )
+        got = hostmod._read_config(cfg)
+        assert got == {
+            "TUIMUX_REFRESH": "7",
+            "TUIMUX_PERSIST": "off",
+            "TUIMUX_QUIET": "2.5",
+        }
+        assert hostmod._read_config(os.path.join(d, "missing")) == {}
+    orig = hostmod._CONFIG
+    hostmod._CONFIG = {"TUIMUX_REFRESH": "7"}
+    try:
+        assert hostmod._setting("TUIMUX_REFRESH", "3") == "7"  # from the file
+        os.environ["TUIMUX_REFRESH"] = "9"
+        assert hostmod._setting("TUIMUX_REFRESH", "3") == "9"  # env wins
+        del os.environ["TUIMUX_REFRESH"]
+        assert hostmod._setting("TUIMUX_QUIET", "1.2") == "1.2"  # default
+    finally:
+        hostmod._CONFIG = orig
+        os.environ.pop("TUIMUX_REFRESH", None)
+
+
 def test_quitting_closes_the_ssh_shells():
     # the pool is created lazily inside hosts, so the app must read it live
     closed = []
@@ -2427,6 +2459,8 @@ def test_routine_row_blinks_only_when_an_open_run_wants_you():
     calm = _routine_app(sessions=[], since=app.time.time())  # just scheduled
     assert "blink" not in _cell_styles(calm._routine_row(calm._routines[0], 0)[2])
     assert _cell_text(calm._host_header_row("box")[1]) == "online"
+    me = _cell_text(calm._host_header_row("me")[0]), calm._host_header_row("me")[1]
+    assert me[0] == "● me" and _cell_text(me[1]) == "local"  # this machine
 
 
 def test_probe_marks_a_run_joined_then_done():

@@ -6,6 +6,7 @@
 - **Unattended routines** (`mode = "unattended"`) run `claude -p` with an `allow` list of tools, close themselves, and show `done` or `failed`. A MODE column shows which kind each routine is.
 - A calmer graphite look, with the sessions and routines columns aligned.
 - More responsive over high-latency tailnets.
+- The dashboard's settings (`TUIMUX_REFRESH`, the timeouts, `TUIMUX_PERSIST`, …) now work from `~/.config/tuimux/config` too, not only as environment variables.
 - CI runs ruff and pytest on Python 3.11–3.13; pre-commit and Dependabot are set up. `app.py` is split into smaller modules.
 
 ## v0.3.0 — 2026-10-06
