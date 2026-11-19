@@ -2437,7 +2437,7 @@ def test_routine_status_lifecycle():
             {**open_run, "sess": agent("idle"), "opened": True, "due": True},
             ("finish it · since Mon", "to finish"),
         ),
-        ({"enabled": False}, ("paused", None)),
+        ({"enabled": False}, ("off", None)),
         ({"sched_ok": False}, ("fix schedule", None)),
         # unattended: an open session is just working, never waiting on you
         (
@@ -2459,7 +2459,7 @@ def test_routine_status_lifecycle():
     assert "#" not in styles["done Mon ✓"] and "#" not in styles["scheduled"]
 
 
-def test_a_pause_shows_next_to_the_run_state():
+def test_off_shows_next_to_the_run_state():
     agent = lambda st: {**_live("routine-lit"), "agent": True, "state": st}  # noqa: E731
     now = datetime(2026, 11, 15, 12, 0).timestamp()
     mon = datetime(2026, 11, 9, 9, 0).timestamp()
@@ -2467,10 +2467,10 @@ def test_a_pause_shows_next_to_the_run_state():
         sched_ok=True, enabled=False, sess=None, due=False, live=True, probed=True
     )
     status = lambda **kw: routine_cells._routine_status(**{**base, **kw}, now=now)  # noqa: E731
-    assert status(since=mon, sess=agent("waiting"))[0] == "answer it · paused"
-    assert status(done_at=mon)[0] == "done Mon ✓ · paused"
-    assert status(done_at=mon, exit_code=2)[0] == "failed Mon · paused"
-    assert status()[0] == "paused"
+    assert status(since=mon, sess=agent("waiting"))[0] == "answer it · off"
+    assert status(done_at=mon)[0] == "done Mon ✓ · off"
+    assert status(done_at=mon, exit_code=2)[0] == "failed Mon · off"
+    assert status()[0] == "off"
 
 
 def test_routine_menu_offers_what_fits_the_run():
@@ -2482,17 +2482,17 @@ def test_routine_menu_offers_what_fits_the_run():
     labels = dict(
         (i, t) for t, i in routine_cells._routine_options({"enabled": False}, False)
     )
-    assert labels["toggle"] == "▶  resume"
+    assert labels["toggle"] == "●  turn on"
 
 
-def test_space_on_a_routine_opens_its_menu_and_pauses_nothing():
+def test_space_on_a_routine_opens_its_menu_and_turns_nothing_off():
     a = _routine_app(sessions=[])
     a._cur_routine = lambda: a._routines[0]
     shown = []
     a.push_screen = lambda screen, cb: shown.append((screen, cb))
     a.action_routine_menu()
     ((menu, chosen),) = shown
-    assert menu.title_text == "lit" and a._routines[0]["enabled"]  # not paused
+    assert menu.title_text == "lit" and a._routines[0]["enabled"]  # still on
     saved = []
     a._save_routines = lambda: saved.append(True)
     a.notify = lambda *x, **k: None
@@ -2674,7 +2674,7 @@ def test_routine_detail_card():
     r = _routine(folder="~/repo", enabled=False, prompt="/lit\nmore")
     entry = routines.new_entry(0)
     first, second = routine_cells._routine_detail(r, entry, now=1000).plain.split("\n")
-    assert first == "Daily · 09:00  ·  ~/repo  ·  /lit  ↵  more  ·  paused"
+    assert first == "Daily · 09:00  ·  ~/repo  ·  /lit  ↵  more  ·  off"
     assert second == "never run"
     day = datetime.fromtimestamp(0).strftime("%-d %b")
     routines.add_run(entry, 0, failed=True)
@@ -2879,7 +2879,7 @@ def test_engine_outcome_and_claude_check_scripts():
         assert sh(check) == claude
 
 
-def test_duplicate_opens_a_paused_copy():
+def test_duplicate_opens_a_copy_that_is_off():
     a = _routine_app(sessions=[])
     a._cur_routine = lambda: a._routines[0]
     a._compute_hosts = lambda also="": ["box"]

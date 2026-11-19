@@ -1,4 +1,4 @@
-"""What you can do to routines: run, mark done, add, edit, copy, delete, pause."""
+"""What you can do to routines: run, mark done, add, edit, copy, delete, turn off."""
 
 import time
 
@@ -143,7 +143,7 @@ class RoutineActions:
         name, n = f"{src['name']}-copy", 2
         while name in taken:
             name, n = f"{src['name']}-copy-{n}", n + 1
-        # paused, so the copy can't fire before you've adjusted it
+        # off, so the copy can't fire before you've adjusted it
         copy = {**src, "name": name, "enabled": False}
 
         def done(r):
@@ -152,7 +152,7 @@ class RoutineActions:
                 self._rstate[r["name"]] = routines.new_entry(time.time())
                 self._save_state()
                 self._save_routines()
-                self.notify(f"{r['name']} added, paused — space resumes it", timeout=4)
+                self.notify(f"{r['name']} added, off — space turns it on", timeout=4)
 
         self.push_screen(
             RoutineForm(
@@ -245,10 +245,10 @@ class RoutineActions:
         )
 
     def action_routine_toggle(self):
-        """Pause or resume the highlighted routine."""
+        """Turn the highlighted routine off or on."""
         r = self._cur_routine()
         if r is None:
             return
         r["enabled"] = not r["enabled"]
         self._save_routines()
-        self.notify(f"{r['name']} {'resumed' if r['enabled'] else 'paused'}", timeout=4)
+        self.notify(f"{r['name']} {'on' if r['enabled'] else 'off'}", timeout=4)
