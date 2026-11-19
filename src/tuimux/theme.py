@@ -79,7 +79,7 @@ ROUTINE_COLUMNS = (
 #   blue  → "claude" in the TABS column (AGENT).
 #   steel → keys and focus ($primary), e.g. a key named in a hint.
 #   plain → active (running, working, starting); dim → everything else:
-#           metadata, idle or offline, paused, done, scheduled.
+#           metadata, idle or offline, off, done, scheduled.
 #   bold  → machine names, their dots, and the item a hint is about.
 
 

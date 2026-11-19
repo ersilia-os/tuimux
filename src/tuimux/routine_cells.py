@@ -36,7 +36,7 @@ def _routine_detail(r, entry=None, failed="", now=None):
     if _unattended(r):
         body.append("  ·  unattended", "dim")
     if not r["enabled"]:
-        body.append("  ·  paused", "dim")
+        body.append("  ·  off", "dim")
     body.append("\n")
     _append_latest(body, r, routines.current_run(entry), failed, now)
     _append_earlier(body, entry.get("runs", []))
@@ -167,7 +167,7 @@ def _routine_options(r, open_run):
     opts += [
         ("✎  edit", "edit"),
         ("⧉  duplicate", "copy"),
-        ("⏸  pause" if r["enabled"] else "▶  resume", "toggle"),
+        ("○  turn off" if r["enabled"] else "●  turn on", "toggle"),
         ("✕  delete", "delete"),
     ]
     return opts
@@ -225,7 +225,7 @@ def _routine_status(
     Parameters
     ----------
     sched_ok, enabled : bool
-        Whether the schedule parses, and whether the routine is paused.
+        Whether the schedule parses, and whether the routine is off.
     sess : dict or None
         The run's open session (from the probe), or None.
     due : bool
@@ -252,8 +252,8 @@ def _routine_status(
     """
     now = now or time.time()
     when = _day(since, now) if since else "—"
-    # a pause never hides: it takes the place of "since …" on an open run
-    tail = f"since {when}" if enabled else "paused"
+    # "off" never hides: it takes the place of "since …" on an open run
+    tail = f"since {when}" if enabled else "off"
     if sess is not None:  # a run is open on its computer
         st = sess.get("state")
         if unattended or st in ("running", "working"):  # claude -p, or busy
@@ -269,12 +269,12 @@ def _routine_status(
         return (f"close it · {tail}", "dim", None)  # read; d marks it done
     if not sched_ok:
         return ("fix schedule", RED, None)
-    if not enabled:  # paused: still say how its last run went
+    if not enabled:  # off: still say how its last run went
         if done_at and exit_code:
-            return (f"failed {_day(done_at, now)} · paused", RED, None)
+            return (f"failed {_day(done_at, now)} · off", RED, None)
         if done_at:
-            return (f"done {_day(done_at, now)} ✓ · paused", "dim", None)
-        return ("paused", "dim", None)
+            return (f"done {_day(done_at, now)} ✓ · off", "dim", None)
+        return ("off", "dim", None)
     if failed:
         return ("couldn't start", RED, None)  # retried; the card says why
     if launching or (due and live):
